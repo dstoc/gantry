@@ -1,19 +1,30 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use regorus::Engine as RegoEngine;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const REGO_ALLOW_QUERY: &str = "data.sandbox.main.allow";
+use crate::filesystem::{
+    FilesystemProfile, load_profiles, validate_baffle_filename, validate_profile_name,
+};
 
-#[derive(Debug, Error)]
+const REGO_DECISION_QUERY: &str = "data.sandbox.main.decision";
+static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Error, Clone)]
 pub enum ValidationError {
     #[error("Policy deny-all is active: {details}")]
     PolicyUnavailable { details: String },
     #[error("Policy evaluation failed for '{command}': {details}")]
     PolicyEvaluationFailed { command: String, details: String },
+    #[error("Invalid authorization decision for '{command}': {details}")]
+    InvalidDecision { command: String, details: String },
+    #[error("Decision is incompatible with backend '{backend}': {details}")]
+    IncompatibleBackend { backend: String, details: String },
     #[error("Command not allowed: {0}")]
     CommandNotAllowed(String),
     #[error("Failed to resolve executable path for '{command}': {details}")]
@@ -37,7 +48,7 @@ struct RegoPolicy {
 }
 
 impl RegoPolicy {
-    fn evaluate(&self, input: &PolicyEvaluationInput) -> Result<bool, String> {
+    fn evaluate(&self, input: &PolicyEvaluationInput) -> Result<serde_json::Value, String> {
         let mut engine = self.engine.clone();
         let input_value = serde_json::json!({
             "command": input.command,
@@ -48,43 +59,72 @@ impl RegoPolicy {
             "cwd": input.cwd,
         });
         engine.set_input(regorus::Value::from(input_value));
-        engine
-            .eval_bool_query(REGO_ALLOW_QUERY.to_string(), false)
-            .map_err(|error| error.to_string())
+        let results = engine
+            .eval_query(REGO_DECISION_QUERY.to_string(), false)
+            .map_err(|error| error.to_string())?;
+        if results.result.len() != 1 {
+            return Err(format!(
+                "decision query returned {} results; expected exactly one",
+                results.result.len()
+            ));
+        }
+        let result = &results.result[0];
+        if result.expressions.len() != 1 {
+            return Err(format!(
+                "decision query returned {} values; expected exactly one",
+                result.expressions.len()
+            ));
+        }
+        serde_json::to_value(&result.expressions[0].value).map_err(|error| error.to_string())
     }
 }
 
-#[derive(Debug, Clone)]
-struct PolicySnapshot {
+#[derive(Debug)]
+pub(crate) struct PolicyGeneration {
+    id: u64,
     mode: PolicyMode,
     rego: Option<RegoPolicy>,
+    filesystem_profiles: BTreeMap<String, Arc<FilesystemProfile>>,
     deny_reason: Option<String>,
     fingerprint: Option<PolicyFingerprint>,
 }
 
-impl PolicySnapshot {
+impl PolicyGeneration {
     fn deny_all(details: impl Into<String>) -> Self {
         Self {
+            id: NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed),
             mode: PolicyMode::DenyAll,
             rego: None,
+            filesystem_profiles: BTreeMap::new(),
             deny_reason: Some(details.into()),
             fingerprint: None,
         }
     }
 
-    fn from_rego(policy: RegoPolicy, fingerprint: Option<PolicyFingerprint>) -> Self {
+    fn from_rego(
+        policy: RegoPolicy,
+        filesystem_profiles: BTreeMap<String, Arc<FilesystemProfile>>,
+        fingerprint: Option<PolicyFingerprint>,
+    ) -> Self {
         Self {
+            id: NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed),
             mode: PolicyMode::Rego,
             rego: Some(policy),
+            filesystem_profiles,
             deny_reason: None,
             fingerprint,
         }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 }
 
 #[derive(Debug, Clone)]
 struct PolicySources {
     policy_dir: Option<PathBuf>,
+    filesystem_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,14 +135,29 @@ struct PolicyFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PolicyFileFingerprint {
     path: PathBuf,
-    len: u64,
-    modified: SystemTime,
+    digest: [u8; 32],
 }
 
 #[derive(Debug)]
 pub struct PolicyEngine {
-    state: RwLock<PolicySnapshot>,
+    state: RwLock<Arc<PolicyGeneration>>,
     sources: PolicySources,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyDecision {
+    pub(crate) allow: bool,
+    pub(crate) filesystem: Option<String>,
+    pub(crate) baffle_session: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PolicyAuthorization {
+    pub(crate) decision: PolicyDecision,
+    pub(crate) filesystem_profile: Option<Arc<FilesystemProfile>>,
+    pub(crate) generation: Arc<PolicyGeneration>,
+    pub(crate) validation_error: Option<ValidationError>,
 }
 
 #[derive(Debug)]
@@ -117,14 +172,20 @@ struct PolicyEvaluationInput<'a> {
 
 impl PolicyEngine {
     pub fn from_sources(policy_dir: Option<PathBuf>) -> Self {
-        let sources = PolicySources { policy_dir };
+        let filesystem_dir = policy_dir
+            .as_ref()
+            .map(|directory| directory.parent().unwrap_or(directory).join("filesystems"));
+        let sources = PolicySources {
+            policy_dir,
+            filesystem_dir,
+        };
 
         let snapshot = match load_policy_snapshot(&sources) {
             Ok(snapshot) => {
                 if let Some(rego) = &snapshot.rego {
                     tracing::info!(
                         mode = "rego",
-                        query = REGO_ALLOW_QUERY,
+                        query = REGO_DECISION_QUERY,
                         modules = rego.module_count,
                         "policy engine initialized",
                     );
@@ -133,7 +194,7 @@ impl PolicyEngine {
             }
             Err(error) => {
                 tracing::warn!(error = %error, "policy engine initialized in deny-all mode");
-                PolicySnapshot::deny_all(error)
+                Arc::new(PolicyGeneration::deny_all(error))
             }
         };
 
@@ -147,8 +208,15 @@ impl PolicyEngine {
     pub fn from_rego_for_tests(modules: &[(&str, &str)]) -> Self {
         let rego = load_rego_modules(modules).expect("failed to load Rego test modules");
         Self {
-            state: RwLock::new(PolicySnapshot::from_rego(rego, None)),
-            sources: PolicySources { policy_dir: None },
+            state: RwLock::new(Arc::new(PolicyGeneration::from_rego(
+                rego,
+                BTreeMap::new(),
+                None,
+            ))),
+            sources: PolicySources {
+                policy_dir: None,
+                filesystem_dir: None,
+            },
         }
     }
 
@@ -160,7 +228,7 @@ impl PolicyEngine {
             .clone()
     }
 
-    pub fn validate_invocation(
+    pub(crate) fn authorize_invocation(
         &self,
         command: &str,
         path: &str,
@@ -168,15 +236,14 @@ impl PolicyEngine {
         args: &[String],
         env: &BTreeMap<String, String>,
         cwd: &str,
-    ) -> Result<(), ValidationError> {
+    ) -> Result<PolicyAuthorization, ValidationError> {
         self.reload_if_changed();
 
-        let snapshot = self
+        let generation = self
             .state
             .read()
             .expect("policy state read lock poisoned")
             .clone();
-
         let evaluation_input = PolicyEvaluationInput {
             command,
             path,
@@ -186,28 +253,74 @@ impl PolicyEngine {
             cwd,
         };
 
-        match snapshot.mode {
-            PolicyMode::Rego => {
-                let rego = snapshot
-                    .rego
-                    .ok_or_else(|| ValidationError::PolicyUnavailable {
-                        details: "internal policy state mismatch".to_string(),
+        let policy_decision =
+            match &generation.mode {
+                PolicyMode::Rego => {
+                    let rego = generation.rego.as_ref().ok_or_else(|| {
+                        ValidationError::PolicyUnavailable {
+                            details: "internal policy state mismatch".to_string(),
+                        }
                     })?;
-
-                match rego.evaluate(&evaluation_input) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(ValidationError::CommandNotAllowed(command.to_string())),
-                    Err(details) => Err(ValidationError::PolicyEvaluationFailed {
-                        command: command.to_string(),
-                        details,
-                    }),
+                    let value = rego.evaluate(&evaluation_input).map_err(|details| {
+                        ValidationError::PolicyEvaluationFailed {
+                            command: command.to_string(),
+                            details,
+                        }
+                    })?;
+                    parse_decision(command, value)?
                 }
+                PolicyMode::DenyAll => {
+                    return Err(ValidationError::PolicyUnavailable {
+                        details: generation.deny_reason.clone().unwrap_or_else(|| {
+                            "policy state is invalid and command execution is denied".to_string()
+                        }),
+                    });
+                }
+            };
+
+        let (filesystem_profile, validation_error) = if policy_decision.allow {
+            if let Some(name) = &policy_decision.filesystem {
+                match generation.filesystem_profiles.get(name).cloned() {
+                    Some(profile) => (Some(profile), None),
+                    None => (
+                        None,
+                        Some(ValidationError::InvalidDecision {
+                            command: command.to_string(),
+                            details: format!("filesystem profile '{name}' is not configured"),
+                        }),
+                    ),
+                }
+            } else {
+                (None, None)
             }
-            PolicyMode::DenyAll => Err(ValidationError::PolicyUnavailable {
-                details: snapshot.deny_reason.unwrap_or_else(|| {
-                    "policy state is invalid and command execution is denied".to_string()
-                }),
-            }),
+        } else {
+            (None, None)
+        };
+
+        Ok(PolicyAuthorization {
+            decision: policy_decision,
+            filesystem_profile,
+            generation,
+            validation_error,
+        })
+    }
+
+    pub fn validate_invocation(
+        &self,
+        command: &str,
+        path: &str,
+        hash: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &str,
+    ) -> Result<(), ValidationError> {
+        let authorization = self.authorize_invocation(command, path, hash, args, env, cwd)?;
+        if let Some(error) = authorization.validation_error {
+            Err(error)
+        } else if authorization.decision.allow {
+            Ok(())
+        } else {
+            Err(ValidationError::CommandNotAllowed(command.to_string()))
         }
     }
 
@@ -217,7 +330,7 @@ impl PolicyEngine {
                 if let Some(rego) = &snapshot.rego {
                     tracing::info!(
                         mode = "rego",
-                        query = REGO_ALLOW_QUERY,
+                        query = REGO_DECISION_QUERY,
                         modules = rego.module_count,
                         "policy reload succeeded",
                     );
@@ -233,17 +346,17 @@ impl PolicyEngine {
                     .state
                     .write()
                     .expect("policy state write lock poisoned") =
-                    PolicySnapshot::deny_all(error.to_string());
+                    Arc::new(PolicyGeneration::deny_all(error.to_string()));
             }
         }
     }
 
     fn reload_if_changed(&self) {
-        let Some(policy_dir) = self.sources.policy_dir.as_ref() else {
+        if self.sources.policy_dir.is_none() {
             return;
-        };
+        }
 
-        let current = match fingerprint_policy_dir(policy_dir) {
+        let current = match fingerprint_sources(&self.sources) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 tracing::error!(error = %error, "policy fingerprint failed; deny-all activated");
@@ -251,7 +364,7 @@ impl PolicyEngine {
                     .state
                     .write()
                     .expect("policy state write lock poisoned") =
-                    PolicySnapshot::deny_all(error.to_string());
+                    Arc::new(PolicyGeneration::deny_all(error.to_string()));
                 return;
             }
         };
@@ -271,15 +384,29 @@ impl PolicyEngine {
     }
 }
 
-fn load_policy_snapshot(sources: &PolicySources) -> Result<PolicySnapshot, String> {
+fn load_policy_snapshot(sources: &PolicySources) -> Result<Arc<PolicyGeneration>, String> {
     let policy_dir = sources
         .policy_dir
         .as_ref()
-        .ok_or_else(|| "POLICY_DIR is not configured".to_string())?;
+        .ok_or_else(|| "GANTRY_POLICY_DIR is not configured".to_string())?;
 
-    let (rego, fingerprint) = load_rego_policy_dir(policy_dir)
+    let rego = load_rego_policy_dir(policy_dir)
         .map_err(|error| format!("rego policy load failed: {error}"))?;
-    Ok(PolicySnapshot::from_rego(rego, Some(fingerprint)))
+    let filesystem_profiles = if let Some(directory) = &sources.filesystem_dir {
+        load_profiles(directory)
+            .map_err(|error| format!("filesystem profile load failed: {error}"))?
+            .into_iter()
+            .map(|(name, profile)| (name, Arc::new(profile)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let fingerprint = fingerprint_sources(sources)?;
+    Ok(Arc::new(PolicyGeneration::from_rego(
+        rego,
+        filesystem_profiles,
+        Some(fingerprint),
+    )))
 }
 
 #[cfg(test)]
@@ -297,7 +424,7 @@ fn load_rego_modules(modules: &[(&str, &str)]) -> Result<RegoPolicy, String> {
     })
 }
 
-fn load_rego_policy_dir(policy_dir: &Path) -> Result<(RegoPolicy, PolicyFingerprint), String> {
+fn load_rego_policy_dir(policy_dir: &Path) -> Result<RegoPolicy, String> {
     let mut files = Vec::new();
     collect_rego_files(policy_dir, &mut files).map_err(|error| {
         format!(
@@ -314,9 +441,6 @@ fn load_rego_policy_dir(policy_dir: &Path) -> Result<(RegoPolicy, PolicyFingerpr
     }
 
     files.sort();
-    let fingerprint = fingerprint_rego_files(&files)
-        .map_err(|error| format!("failed fingerprinting policy files: {error}"))?;
-
     let mut engine = RegoEngine::new();
     for file in &files {
         let source = std::fs::read_to_string(file)
@@ -327,13 +451,10 @@ fn load_rego_policy_dir(policy_dir: &Path) -> Result<(RegoPolicy, PolicyFingerpr
             .map_err(|error| format!("failed compiling '{}': {error}", file.display()))?;
     }
 
-    Ok((
-        RegoPolicy {
-            engine,
-            module_count: files.len(),
-        },
-        fingerprint,
-    ))
+    Ok(RegoPolicy {
+        engine,
+        module_count: files.len(),
+    })
 }
 
 fn collect_rego_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
@@ -354,7 +475,11 @@ fn collect_rego_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io:
     Ok(())
 }
 
-fn fingerprint_policy_dir(policy_dir: &Path) -> Result<PolicyFingerprint, String> {
+fn fingerprint_sources(sources: &PolicySources) -> Result<PolicyFingerprint, String> {
+    let policy_dir = sources
+        .policy_dir
+        .as_ref()
+        .ok_or_else(|| "GANTRY_POLICY_DIR is not configured".to_string())?;
     let mut files = Vec::new();
     collect_rego_files(policy_dir, &mut files).map_err(|error| {
         format!(
@@ -371,28 +496,105 @@ fn fingerprint_policy_dir(policy_dir: &Path) -> Result<PolicyFingerprint, String
     }
 
     files.sort();
-    fingerprint_rego_files(&files).map_err(|error| {
-        format!(
-            "failed fingerprinting policy directory '{}': {error}",
-            policy_dir.display()
-        )
-    })
+    if let Some(filesystem_dir) = &sources.filesystem_dir {
+        match std::fs::read_dir(filesystem_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        format!(
+                            "failed reading filesystem profile directory '{}': {error}",
+                            filesystem_dir.display()
+                        )
+                    })?;
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) == Some("toml") {
+                        files.push(path);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed reading filesystem profile directory '{}': {error}",
+                    filesystem_dir.display()
+                ));
+            }
+        }
+    }
+    files.sort();
+    fingerprint_files(&files)
+        .map_err(|error| format!("failed fingerprinting policy generation: {error}"))
 }
 
-fn fingerprint_rego_files(files: &[PathBuf]) -> Result<PolicyFingerprint, std::io::Error> {
+fn fingerprint_files(files: &[PathBuf]) -> Result<PolicyFingerprint, std::io::Error> {
     let mut fingerprint_files = Vec::with_capacity(files.len());
     for file in files {
-        let metadata = std::fs::metadata(file)?;
+        let contents = std::fs::read(file)?;
+        let digest: [u8; 32] = Sha256::digest(&contents).into();
         fingerprint_files.push(PolicyFileFingerprint {
             path: file.clone(),
-            len: metadata.len(),
-            modified: metadata.modified()?,
+            digest,
         });
     }
 
     Ok(PolicyFingerprint {
         files: fingerprint_files,
     })
+}
+
+fn parse_decision(
+    command: &str,
+    value: serde_json::Value,
+) -> Result<PolicyDecision, ValidationError> {
+    let invalid = |details: String| ValidationError::InvalidDecision {
+        command: command.to_string(),
+        details,
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("decision must be an object".to_string()))?;
+    let allow = object
+        .get("allow")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| invalid("decision must contain a boolean 'allow' field".to_string()))?;
+    if !allow {
+        return Ok(PolicyDecision {
+            allow: false,
+            filesystem: None,
+            baffle_session: None,
+        });
+    }
+    for field in ["filesystem", "baffle_session"] {
+        if !object.contains_key(field) {
+            return Err(invalid(format!(
+                "allowed decision is missing required '{field}' field"
+            )));
+        }
+    }
+    if let Some(field) = object
+        .keys()
+        .find(|key| !["allow", "filesystem", "baffle_session"].contains(&key.as_str()))
+    {
+        return Err(invalid(format!("unknown decision field '{field}'")));
+    }
+    for field in ["filesystem", "baffle_session"] {
+        let value = object.get(field).expect("required field checked above");
+        if !value.is_null() && !value.is_string() {
+            return Err(invalid(format!("'{field}' must be a string or null")));
+        }
+    }
+    let decision: PolicyDecision = serde_json::from_value(value).map_err(|error| {
+        invalid(format!(
+            "decision fields have invalid types or names: {error}"
+        ))
+    })?;
+    if let Some(name) = &decision.filesystem {
+        validate_profile_name(name).map_err(invalid)?;
+    }
+    if let Some(name) = &decision.baffle_session {
+        validate_baffle_filename(name).map_err(invalid)?;
+    }
+    Ok(decision)
 }
 
 #[cfg(test)]
@@ -407,9 +609,9 @@ mod tests {
             dir.join("main.rego"),
             r#"package sandbox.main
 
-default allow = false
+default decision := {"allow": false, "filesystem": null, "baffle_session": null}
 
-allow if {
+decision := {"allow": true, "filesystem": null, "baffle_session": null} if {
   data.sandbox[input.command].allow
 }
 "#,
@@ -577,9 +779,9 @@ allow if {
                 "main.rego",
                 r#"package sandbox.main
 
-default allow = false
+default decision := {"allow": false, "filesystem": null, "baffle_session": null}
 
-allow if {
+decision := {"allow": true, "filesystem": null, "baffle_session": null} if {
   data.sandbox[input.command].allow
 }
 "#,
@@ -742,5 +944,219 @@ allow if {
     fn missing_policy_dir_is_deny_all() {
         let engine = PolicyEngine::from_sources(None);
         assert_eq!(engine.mode(), PolicyMode::DenyAll);
+    }
+
+    fn authorize_test_policy(module: &str) -> Result<PolicyAuthorization, ValidationError> {
+        let engine = PolicyEngine::from_rego_for_tests(&[("main.rego", module)]);
+        engine.authorize_invocation(
+            "echo",
+            "/usr/bin/echo",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            &[],
+            &BTreeMap::new(),
+            "/workspace",
+        )
+    }
+
+    #[test]
+    fn structured_decision_requires_explicit_fields_and_valid_types() {
+        let valid_nulls = r#"package sandbox.main
+
+decision := {"allow": true, "filesystem": null, "baffle_session": null}
+"#;
+        let authorization = authorize_test_policy(valid_nulls).expect("explicit nulls are valid");
+        assert!(authorization.decision.allow);
+        assert_eq!(authorization.decision.filesystem, None);
+        assert_eq!(authorization.decision.baffle_session, None);
+
+        let denied =
+            authorize_test_policy("package sandbox.main\n\ndecision := {\"allow\": false}")
+                .expect("deny decisions only need allow");
+        assert!(!denied.decision.allow);
+
+        for (name, decision, reason) in [
+            (
+                "missing filesystem",
+                r#"{"allow": true, "baffle_session": null}"#,
+                "missing required 'filesystem'",
+            ),
+            (
+                "missing baffle",
+                r#"{"allow": true, "filesystem": null}"#,
+                "missing required 'baffle_session'",
+            ),
+            (
+                "wrong allow type",
+                r#"{"allow": "yes", "filesystem": null, "baffle_session": null}"#,
+                "boolean 'allow'",
+            ),
+            (
+                "wrong filesystem type",
+                r#"{"allow": true, "filesystem": 1, "baffle_session": null}"#,
+                "string or null",
+            ),
+            (
+                "wrong baffle type",
+                r#"{"allow": true, "filesystem": null, "baffle_session": false}"#,
+                "string or null",
+            ),
+            (
+                "extra field",
+                r#"{"allow": true, "filesystem": null, "baffle_session": null, "backend": "direct"}"#,
+                "unknown decision field",
+            ),
+            (
+                "bad profile name",
+                r#"{"allow": true, "filesystem": "../root", "baffle_session": null}"#,
+                "invalid filesystem profile name",
+            ),
+            (
+                "bad baffle filename",
+                r#"{"allow": true, "filesystem": null, "baffle_session": "../secret.toml"}"#,
+                "invalid Baffle session filename",
+            ),
+        ] {
+            let module = format!("package sandbox.main\n\ndecision := {decision}");
+            let error = authorize_test_policy(&module).expect_err(name);
+            assert!(error.to_string().contains(reason), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn undefined_and_conflicting_decisions_fail_closed() {
+        let undefined = "package sandbox.main\n";
+        assert!(matches!(
+            authorize_test_policy(undefined),
+            Err(ValidationError::PolicyEvaluationFailed { .. })
+        ));
+
+        let conflict = r#"package sandbox.main
+
+decision := {"allow": true, "filesystem": null, "baffle_session": null} if { input.command == "echo" }
+decision := {"allow": true, "filesystem": "other", "baffle_session": null} if { input.command == "echo" }
+"#;
+        assert!(matches!(
+            authorize_test_policy(conflict),
+            Err(ValidationError::PolicyEvaluationFailed { .. })
+        ));
+    }
+
+    fn write_decision_policy(policy_dir: &Path, filesystem: &str) {
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            format!(
+                "package sandbox.main\n\ndecision := {{\"allow\": true, \"filesystem\": \"{filesystem}\", \"baffle_session\": null}}\n"
+            ),
+        )
+        .expect("write policy");
+    }
+
+    fn write_bind_profile(directory: &Path, name: &str, source: &Path) {
+        std::fs::create_dir_all(directory).expect("create profile directory");
+        std::fs::write(
+            directory.join(format!("{name}.toml")),
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = \"/workspace\"\naccess = \"read-only\"\n",
+                source.to_string_lossy()
+            ),
+        )
+        .expect("write profile");
+    }
+
+    #[test]
+    fn policy_and_filesystem_profiles_publish_as_one_retained_generation() {
+        let root = tempdir().expect("temp policy root");
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        let first_source = root.path().join("workspace-one");
+        let second_source = root.path().join("workspace-two");
+        std::fs::create_dir_all(&policy_dir).expect("create policy directory");
+        std::fs::create_dir(&first_source).expect("create first mount source");
+        std::fs::create_dir(&second_source).expect("create second mount source");
+        write_decision_policy(&policy_dir, "workspace-one");
+        write_bind_profile(&filesystem_dir, "workspace-one", &first_source);
+
+        let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+        let hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let first = engine
+            .authorize_invocation("echo", "/usr/bin/echo", hash, &[], &BTreeMap::new(), "/")
+            .expect("first generation authorizes");
+        let first_id = first.generation.id();
+        assert_eq!(first.decision.filesystem.as_deref(), Some("workspace-one"));
+        assert!(Arc::ptr_eq(
+            first.filesystem_profile.as_ref().expect("profile retained"),
+            engine
+                .state
+                .read()
+                .expect("state")
+                .filesystem_profiles
+                .get("workspace-one")
+                .expect("profile in generation"),
+        ));
+
+        write_decision_policy(&policy_dir, "workspace-two");
+        write_bind_profile(&filesystem_dir, "workspace-two", &second_source);
+        let second = engine
+            .authorize_invocation("echo", "/usr/bin/echo", hash, &[], &BTreeMap::new(), "/")
+            .expect("updated generation authorizes");
+
+        assert_ne!(first_id, second.generation.id());
+        assert_eq!(second.decision.filesystem.as_deref(), Some("workspace-two"));
+        assert!(
+            first
+                .generation
+                .filesystem_profiles
+                .contains_key("workspace-one")
+        );
+        assert!(
+            !first
+                .generation
+                .filesystem_profiles
+                .contains_key("workspace-two")
+        );
+        assert_eq!(
+            second
+                .filesystem_profile
+                .as_ref()
+                .expect("new profile")
+                .mounts[0],
+            crate::filesystem::FilesystemMount::Bind {
+                source: second_source,
+                target: PathBuf::from("/workspace"),
+                access: crate::filesystem::MountAccess::ReadOnly,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_profile_reload_activates_deny_all() {
+        let root = tempdir().expect("temp policy root");
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        let source = root.path().join("workspace");
+        std::fs::create_dir_all(&policy_dir).expect("create policy directory");
+        std::fs::create_dir(&source).expect("create source");
+        write_decision_policy(&policy_dir, "workspace");
+        write_bind_profile(&filesystem_dir, "workspace", &source);
+        let engine = PolicyEngine::from_sources(Some(policy_dir));
+        assert_eq!(engine.mode(), PolicyMode::Rego);
+
+        std::fs::write(
+            filesystem_dir.join("workspace.toml"),
+            "version = 1\n\n[[mounts]]\nsource = \"/tmp\"\ntarget = \"/workspace\"\naccess = \"invalid\"\n",
+        )
+        .expect("write invalid profile");
+        let error = engine
+            .authorize_invocation(
+                "echo",
+                "/usr/bin/echo",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                &[],
+                &BTreeMap::new(),
+                "/",
+            )
+            .expect_err("invalid generation denies");
+        assert_eq!(engine.mode(), PolicyMode::DenyAll);
+        assert!(matches!(error, ValidationError::PolicyUnavailable { .. }));
     }
 }

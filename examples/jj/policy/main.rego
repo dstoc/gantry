@@ -1,8 +1,16 @@
 package sandbox.main
 
-default allow = false
+default decision := {
+  "allow": false,
+  "filesystem": null,
+  "baffle_session": null,
+}
 
-allow if {
+decision := {
+  "allow": true,
+  "filesystem": null,
+  "baffle_session": null,
+} if {
   command_allowed
   env_allowed
 }

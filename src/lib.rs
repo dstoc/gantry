@@ -4,18 +4,23 @@
 )))]
 compile_error!("gantry supports Linux and macOS targets on x86_64 and aarch64 only.");
 
+mod execution;
 mod executor;
+mod filesystem;
 mod mcp;
 mod policy;
 mod raw;
 mod remote;
 
+pub use execution::ExecutionBackend;
 pub use executor::{
     MAX_OUTPUT_BYTES, RunCommandCheckOutput, RunCommandInput, RunCommandOutput, TRUNCATION_MARKER,
-    ToolError, check_command, run_command_impl, spawn_command_process,
+    ToolError, check_command, check_command_with_backend, run_command_impl,
+    run_command_with_backend, spawn_command_process, spawn_command_process_with_backend,
 };
 pub use mcp::{
-    AppConfig, AppError, ConfigError, DEFAULT_BIND_ADDR, McpRunServer, build_app, serve,
+    AppConfig, AppError, ConfigError, DEFAULT_BIND_ADDR, McpRunServer, build_app,
+    build_app_with_backend, serve,
 };
 pub use policy::{PolicyEngine, PolicyMode, ValidationError};
 pub use raw::{RawEndpointState, RawErrorBody, RawStreamEvent, raw_handler};

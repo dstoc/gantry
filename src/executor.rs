@@ -11,6 +11,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
+use crate::execution::{AuthorizedInvocation, ExecutionBackend, ExecutionPlan};
 use crate::policy::{PolicyEngine, ValidationError};
 
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -48,6 +49,10 @@ pub struct RunCommandCheckOutput {
     #[serde(default)]
     pub cwd: Option<String>,
     pub policy_mode: String,
+    pub filesystem: Option<String>,
+    #[serde(rename = "baffle_session")]
+    pub baffle_session: Option<String>,
+    pub backend: String,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +61,8 @@ pub enum ToolError {
     Validation(#[from] ValidationError),
     #[error("Failed to start subprocess: {source}")]
     Spawn { source: std::io::Error },
+    #[error("execution backend '{backend}' is not implemented in this release")]
+    BackendUnavailable { backend: String },
     #[error("Failed to wait for subprocess: {source}")]
     Wait { source: std::io::Error },
     #[error("Failed to read stdout: {source}")]
@@ -73,7 +80,16 @@ pub async fn run_command_impl(
     default_cwd: &Path,
     input: RunCommandInput,
 ) -> Result<RunCommandOutput, ToolError> {
-    let mut child = spawn_command_process(policy_engine, default_cwd, input)?;
+    run_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input).await
+}
+
+pub async fn run_command_with_backend(
+    policy_engine: &PolicyEngine,
+    default_cwd: &Path,
+    backend: ExecutionBackend,
+    input: RunCommandInput,
+) -> Result<RunCommandOutput, ToolError> {
+    let mut child = spawn_command_process_with_backend(policy_engine, default_cwd, backend, input)?;
 
     let stdout = child.stdout.take().ok_or_else(|| ToolError::StdoutRead {
         source: std::io::Error::other("stdout pipe missing"),
@@ -114,7 +130,16 @@ pub fn spawn_command_process(
     default_cwd: &Path,
     input: RunCommandInput,
 ) -> Result<Child, ToolError> {
-    let authorization = authorize_command_request(policy_engine, default_cwd, input);
+    spawn_command_process_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input)
+}
+
+pub fn spawn_command_process_with_backend(
+    policy_engine: &PolicyEngine,
+    default_cwd: &Path,
+    backend: ExecutionBackend,
+    input: RunCommandInput,
+) -> Result<Child, ToolError> {
+    let authorization = authorize_command_request(policy_engine, default_cwd, backend, input);
     if !authorization.decision.allowed {
         return Err(ToolError::Validation(
             authorization
@@ -123,20 +148,32 @@ pub fn spawn_command_process(
         ));
     }
 
-    let user_env = authorization.user_env;
-    let resolved_executable = authorization
-        .decision
-        .resolved_path
-        .as_deref()
-        .expect("allowed authorization without resolved executable");
+    if backend == ExecutionBackend::Bubblewrap {
+        return Err(ToolError::BackendUnavailable {
+            backend: backend.as_str().to_string(),
+        });
+    }
+
+    let plan = authorization
+        .plan
+        .as_ref()
+        .expect("allowed authorization without plan");
+    let invocation = &plan.invocation;
     let authorized_cwd = authorization
         .authorized_cwd
         .as_ref()
         .expect("allowed authorization without cwd");
 
-    let mut command = Command::new(resolved_executable);
+    tracing::debug!(
+        executable_hash = %invocation.executable_hash,
+        policy_generation = invocation.generation.id(),
+        cwd = %invocation.cwd_label,
+        effective_cwd = %invocation.cwd.display(),
+        "starting authorized direct invocation",
+    );
+    let mut command = Command::new(&invocation.executable);
     command
-        .args(&authorization.input.args)
+        .args(&invocation.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -144,10 +181,10 @@ pub fn spawn_command_process(
 
     set_authorized_cwd_for_spawn(&mut command, authorized_cwd);
 
-    let command_env = build_command_env(&user_env);
     command.env_clear();
     command.envs(
-        command_env
+        invocation
+            .environment
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
     );
@@ -162,16 +199,24 @@ pub fn check_command(
     default_cwd: &Path,
     input: RunCommandInput,
 ) -> RunCommandCheckOutput {
-    authorize_command_request(policy_engine, default_cwd, input).decision
+    check_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input)
+}
+
+pub fn check_command_with_backend(
+    policy_engine: &PolicyEngine,
+    default_cwd: &Path,
+    backend: ExecutionBackend,
+    input: RunCommandInput,
+) -> RunCommandCheckOutput {
+    authorize_command_request(policy_engine, default_cwd, backend, input).decision
 }
 
 #[derive(Debug)]
 struct CommandAuthorization {
     decision: RunCommandCheckOutput,
     validation_error: Option<ValidationError>,
-    user_env: BTreeMap<String, String>,
-    input: RunCommandInput,
     authorized_cwd: Option<AuthorizedCwd>,
+    plan: Option<ExecutionPlan>,
 }
 
 #[derive(Debug)]
@@ -185,6 +230,7 @@ struct AuthorizedCwd {
 fn authorize_command_request(
     policy_engine: &PolicyEngine,
     default_cwd: &Path,
+    backend: ExecutionBackend,
     input: RunCommandInput,
 ) -> CommandAuthorization {
     let user_env = input.env.clone().unwrap_or_default();
@@ -202,6 +248,9 @@ fn authorize_command_request(
         hash: None,
         cwd: None,
         policy_mode,
+        filesystem: None,
+        baffle_session: None,
+        backend: backend.as_str().to_string(),
     };
 
     let authorized_cwd = match resolve_authorized_cwd(input.cwd.as_deref(), default_cwd) {
@@ -214,9 +263,8 @@ fn authorize_command_request(
             return CommandAuthorization {
                 decision,
                 validation_error: Some(validation_error),
-                user_env,
-                input,
                 authorized_cwd: None,
+                plan: None,
             };
         }
     };
@@ -233,9 +281,8 @@ fn authorize_command_request(
                 return CommandAuthorization {
                     decision,
                     validation_error: Some(validation_error),
-                    user_env,
-                    input,
                     authorized_cwd: Some(authorized_cwd),
+                    plan: None,
                 };
             }
         };
@@ -252,15 +299,14 @@ fn authorize_command_request(
             return CommandAuthorization {
                 decision,
                 validation_error: Some(validation_error),
-                user_env,
-                input,
                 authorized_cwd: Some(authorized_cwd),
+                plan: None,
             };
         }
     };
     decision.hash = Some(executable_hash.clone());
 
-    match policy_engine.validate_invocation(
+    match policy_engine.authorize_invocation(
         &input.executable,
         &resolved_path,
         &executable_hash,
@@ -268,7 +314,66 @@ fn authorize_command_request(
         &user_env,
         &authorized_cwd.cwd_label,
     ) {
-        Ok(()) => {
+        Ok(policy_authorization) if !policy_authorization.decision.allow => {
+            let validation_error = ValidationError::CommandNotAllowed(input.executable.clone());
+            decision.reason = Some(validation_error.to_string());
+            CommandAuthorization {
+                decision,
+                validation_error: Some(validation_error),
+                authorized_cwd: Some(authorized_cwd),
+                plan: None,
+            }
+        }
+        Ok(policy_authorization) => {
+            let policy_decision = &policy_authorization.decision;
+            decision.filesystem = policy_decision.filesystem.clone();
+            decision.baffle_session = policy_decision.baffle_session.clone();
+            if let Some(validation_error) = policy_authorization.validation_error {
+                decision.reason = Some(validation_error.to_string());
+                return CommandAuthorization {
+                    decision,
+                    validation_error: Some(validation_error),
+                    authorized_cwd: Some(authorized_cwd),
+                    plan: None,
+                };
+            }
+            let plan = ExecutionPlan {
+                invocation: AuthorizedInvocation {
+                    executable: PathBuf::from(&resolved_path),
+                    executable_hash: executable_hash.clone(),
+                    args: input.args.clone(),
+                    environment: build_effective_command_env(
+                        &user_env,
+                        backend,
+                        policy_decision.baffle_session.is_some(),
+                    ),
+                    cwd: authorized_cwd.effective_input.clone(),
+                    cwd_label: authorized_cwd.cwd_label.clone(),
+                    generation: policy_authorization.generation.clone(),
+                },
+                backend,
+                filesystem: policy_authorization.filesystem_profile,
+                baffle_session: policy_decision.baffle_session.clone(),
+            };
+            if let Err(details) = plan.validate_compatibility() {
+                let validation_error = ValidationError::IncompatibleBackend {
+                    backend: backend.as_str().to_string(),
+                    details,
+                };
+                decision.reason = Some(validation_error.to_string());
+                return CommandAuthorization {
+                    decision,
+                    validation_error: Some(validation_error),
+                    authorized_cwd: Some(authorized_cwd),
+                    plan: None,
+                };
+            }
+            tracing::debug!(
+                backend = plan.backend.as_str(),
+                policy_generation = plan.invocation.generation.id(),
+                filesystem_profile = ?plan.filesystem.as_ref().map(|profile| profile.name.as_str()),
+                "authorized execution plan created",
+            );
             tracing::info!(
                 command = %input.executable,
                 path = %resolved_path,
@@ -280,9 +385,8 @@ fn authorize_command_request(
             CommandAuthorization {
                 decision,
                 validation_error: None,
-                user_env,
-                input,
                 authorized_cwd: Some(authorized_cwd),
+                plan: Some(plan),
             }
         }
         Err(validation_error) => {
@@ -290,9 +394,8 @@ fn authorize_command_request(
             CommandAuthorization {
                 decision,
                 validation_error: Some(validation_error),
-                user_env,
-                input,
                 authorized_cwd: Some(authorized_cwd),
+                plan: None,
             }
         }
     }
@@ -498,8 +601,14 @@ fn resolve_executable_in_path(
     command: &str,
     search_path: &std::ffi::OsStr,
 ) -> Result<String, String> {
+    let server_cwd = std::env::current_dir()
+        .map_err(|error| format!("failed to read server working directory: {error}"))?;
     for directory in std::env::split_paths(search_path) {
-        let candidate = directory.join(command);
+        let candidate = if directory.is_absolute() {
+            directory.join(command)
+        } else {
+            server_cwd.join(directory).join(command)
+        };
         if !candidate.is_file() {
             continue;
         }
@@ -524,7 +633,16 @@ fn resolve_executable_in_path(
     Err(format!("'{}' was not found on PATH", command))
 }
 
-pub(crate) fn build_command_env(user_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+#[cfg(test)]
+fn build_command_env(user_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    build_effective_command_env(user_env, ExecutionBackend::Direct, false)
+}
+
+fn build_effective_command_env(
+    user_env: &BTreeMap<String, String>,
+    backend: ExecutionBackend,
+    baffle_authorized: bool,
+) -> BTreeMap<String, String> {
     let mut command_env = BTreeMap::new();
 
     for key in ["HOME", "LANG"] {
@@ -577,6 +695,15 @@ pub(crate) fn build_command_env(user_env: &BTreeMap<String, String>) -> BTreeMap
     }
     if let Some(value) = no_proxy {
         command_env.insert("NO_PROXY".to_string(), value);
+    }
+
+    if backend == ExecutionBackend::Bubblewrap {
+        command_env.retain(|key, _| !key.to_ascii_lowercase().ends_with("_proxy"));
+        if baffle_authorized {
+            for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+                command_env.insert(key.to_string(), "http://127.0.0.1:3128".to_string());
+            }
+        }
     }
 
     command_env
@@ -686,7 +813,7 @@ mod tests {
         }
 
         let main = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nallowed_commands := {{\n{allowed_map}}}\n\nallow if {{\n  allowed_commands[input.command]\n}}\n"
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\nallowed_commands := {{\n{allowed_map}}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  allowed_commands[input.command]\n}}\n"
         );
 
         PolicyEngine::from_rego_for_tests(&[("main.rego", &main)])
@@ -694,11 +821,45 @@ mod tests {
 
     fn rego_engine_allow_command_in_cwd(command: &str, cwd: &str) -> PolicyEngine {
         let module = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nallow if {{\n  input.command == {}\n  input.cwd == {}\n}}\n",
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  input.command == {}\n  input.cwd == {}\n}}\n",
             serde_json::to_string(command).expect("command string"),
             serde_json::to_string(cwd).expect("cwd string"),
         );
         PolicyEngine::from_rego_for_tests(&[("main.rego", &module)])
+    }
+
+    fn policy_engine_with_selection(
+        root: &Path,
+        filesystem: Option<&str>,
+        baffle_session: Option<&str>,
+    ) -> PolicyEngine {
+        let policy_dir = root.join("policies");
+        let filesystem_dir = root.join("filesystems");
+        std::fs::create_dir_all(&policy_dir).expect("create policy directory");
+        let decision = serde_json::json!({
+            "allow": true,
+            "filesystem": filesystem,
+            "baffle_session": baffle_session,
+        });
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            format!("package sandbox.main\n\ndecision := {decision}\n"),
+        )
+        .expect("write policy");
+        if let Some(profile_name) = filesystem {
+            let source = root.join("workspace");
+            std::fs::create_dir_all(&source).expect("create mount source");
+            std::fs::create_dir_all(&filesystem_dir).expect("create filesystem directory");
+            std::fs::write(
+                filesystem_dir.join(format!("{profile_name}.toml")),
+                format!(
+                    "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = \"/workspace\"\naccess = \"read-only\"\n",
+                    source.to_string_lossy()
+                ),
+            )
+            .expect("write profile");
+        }
+        PolicyEngine::from_sources(Some(policy_dir))
     }
 
     fn write_executable_script(path: &Path, body: &[u8]) {
@@ -710,6 +871,332 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).expect("set perms");
         }
+    }
+
+    #[test]
+    fn backend_compatibility_matrix_is_reported_by_check_without_execution() {
+        let true_path = find_executable("true").expect("true executable");
+        let default_cwd = default_cwd_for_tests();
+        let input = || RunCommandInput {
+            executable: true_path.clone(),
+            args: vec![],
+            cwd: None,
+            env: None,
+        };
+
+        let direct_root = tempfile::tempdir().expect("direct root");
+        let direct_engine = policy_engine_with_selection(direct_root.path(), None, None);
+        let direct = check_command_with_backend(
+            &direct_engine,
+            &default_cwd,
+            ExecutionBackend::Direct,
+            input(),
+        );
+        assert!(direct.allowed, "{:?}", direct.reason);
+        assert_eq!(direct.backend, "direct");
+        assert_eq!(direct.filesystem, None);
+        assert_eq!(direct.baffle_session, None);
+
+        let missing_profile_root = tempfile::tempdir().expect("missing profile root");
+        let missing_profile_engine =
+            policy_engine_with_selection(missing_profile_root.path(), None, None);
+        let missing_profile = check_command_with_backend(
+            &missing_profile_engine,
+            &default_cwd,
+            ExecutionBackend::Bubblewrap,
+            input(),
+        );
+        assert!(!missing_profile.allowed);
+        assert!(
+            missing_profile
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("requires a named filesystem profile")
+        );
+        assert_eq!(missing_profile.backend, "bubblewrap");
+
+        let profile_root = tempfile::tempdir().expect("profile root");
+        let profile_engine = policy_engine_with_selection(
+            profile_root.path(),
+            Some("workspace-readonly"),
+            Some("github-readonly.toml"),
+        );
+        let bubblewrap = check_command_with_backend(
+            &profile_engine,
+            &default_cwd,
+            ExecutionBackend::Bubblewrap,
+            input(),
+        );
+        assert!(bubblewrap.allowed, "{:?}", bubblewrap.reason);
+        assert_eq!(bubblewrap.filesystem.as_deref(), Some("workspace-readonly"));
+        assert_eq!(
+            bubblewrap.baffle_session.as_deref(),
+            Some("github-readonly.toml")
+        );
+        assert_eq!(bubblewrap.backend, "bubblewrap");
+        let serialized = serde_json::to_value(&bubblewrap).expect("serialize check result");
+        assert_eq!(
+            serialized
+                .get("baffle_session")
+                .and_then(|value| value.as_str()),
+            Some("github-readonly.toml")
+        );
+        assert!(serialized.get("baffleSession").is_none());
+
+        let incompatible_direct = check_command_with_backend(
+            &profile_engine,
+            &default_cwd,
+            ExecutionBackend::Direct,
+            input(),
+        );
+        assert!(!incompatible_direct.allowed);
+        assert!(
+            incompatible_direct
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("requires filesystem: null")
+        );
+        assert_eq!(
+            incompatible_direct.filesystem.as_deref(),
+            Some("workspace-readonly")
+        );
+        assert_eq!(
+            incompatible_direct.baffle_session.as_deref(),
+            Some("github-readonly.toml")
+        );
+    }
+
+    #[test]
+    fn check_reports_a_selected_but_unconfigured_profile() {
+        let true_path = find_executable("true").expect("true executable");
+        let module = r#"package sandbox.main
+
+decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": null}
+"#;
+        let engine = PolicyEngine::from_rego_for_tests(&[("main.rego", module)]);
+        let decision = check_command_with_backend(
+            &engine,
+            &default_cwd_for_tests(),
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: true_path,
+                args: vec![],
+                cwd: None,
+                env: None,
+            },
+        );
+        assert!(!decision.allowed);
+        assert_eq!(decision.filesystem.as_deref(), Some("missing-profile"));
+        assert_eq!(decision.baffle_session, None);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("not configured")
+        );
+    }
+
+    #[test]
+    fn authorized_execution_plan_keeps_its_policy_generation_after_reload() {
+        let true_path = find_executable("true").expect("true executable");
+        let root = tempfile::tempdir().expect("profile root");
+        let engine = policy_engine_with_selection(root.path(), Some("workspace"), None);
+        let default_cwd = default_cwd_for_tests();
+        let input = || RunCommandInput {
+            executable: true_path.clone(),
+            args: vec![],
+            cwd: None,
+            env: None,
+        };
+        let first =
+            authorize_command_request(&engine, &default_cwd, ExecutionBackend::Bubblewrap, input())
+                .plan
+                .expect("first plan");
+        let first_generation = first.invocation.generation.id();
+
+        let other_source = root.path().join("workspace-other");
+        let filesystem_dir = root.path().join("filesystems");
+        std::fs::create_dir(&other_source).expect("create new profile source");
+        std::fs::write(
+            filesystem_dir.join("workspace-other.toml"),
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = \"/workspace-other\"\naccess = \"read-only\"\n",
+                other_source.to_string_lossy()
+            ),
+        )
+        .expect("write new profile");
+        let policy_dir = root.path().join("policies");
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            "package sandbox.main\n\ndecision := {\"allow\": true, \"filesystem\": \"workspace-other\", \"baffle_session\": null}\n",
+        )
+        .expect("update decision");
+
+        let second =
+            authorize_command_request(&engine, &default_cwd, ExecutionBackend::Bubblewrap, input())
+                .plan
+                .expect("second plan");
+        assert_ne!(first_generation, second.invocation.generation.id());
+        assert_eq!(
+            first.filesystem.as_ref().expect("old profile").name,
+            "workspace"
+        );
+        assert_eq!(
+            second.filesystem.as_ref().expect("new profile").name,
+            "workspace-other"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_resolves_a_plan_without_spawning_the_authorized_command() {
+        let temp = tempfile::tempdir_in(default_cwd_for_tests()).expect("tempdir");
+        let script_path = temp.path().join("touch-marker");
+        let marker_path = temp.path().join("spawned");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"$FLAG\" \"$PWD\" > {:?}\n",
+            marker_path
+        );
+        write_executable_script(&script_path, script.as_bytes());
+        let policy_engine =
+            rego_engine_allow_commands(&[script_path.to_str().expect("script path")]);
+        let cwd = temp.path().join("work");
+        std::fs::create_dir(&cwd).expect("create cwd");
+        let authorization = authorize_command_request(
+            &policy_engine,
+            &cwd,
+            ExecutionBackend::Direct,
+            RunCommandInput {
+                executable: script_path.to_string_lossy().into_owned(),
+                args: vec!["literal argument".to_string()],
+                cwd: None,
+                env: Some(BTreeMap::from([("FLAG".to_string(), "kept".to_string())])),
+            },
+        );
+        assert!(
+            authorization.decision.allowed,
+            "{:?}",
+            authorization.decision.reason
+        );
+        let plan = authorization.plan.expect("validated plan");
+        assert_eq!(plan.invocation.executable, script_path);
+        assert_eq!(plan.invocation.args, vec!["literal argument"]);
+        assert_eq!(
+            plan.invocation.environment.get("FLAG").map(String::as_str),
+            Some("kept")
+        );
+        assert_eq!(plan.invocation.cwd, cwd);
+        assert_eq!(plan.invocation.cwd_label, cwd.to_string_lossy());
+        assert!(plan.invocation.generation.id() > 0);
+        assert!(!marker_path.exists(), "check must not spawn the command");
+    }
+
+    #[test]
+    fn bubblewrap_plans_control_proxy_environment_by_baffle_selection() {
+        let true_path = find_executable("true").expect("true executable");
+        let default_cwd = default_cwd_for_tests();
+        let forwarded_env = Some(BTreeMap::from([
+            (
+                "ALL_PROXY".to_string(),
+                "http://untrusted.invalid:8080".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "*".to_string()),
+            (
+                "CUSTOM_proxy".to_string(),
+                "http://untrusted.invalid:8080".to_string(),
+            ),
+            ("FLAG".to_string(), "kept".to_string()),
+        ]));
+        let no_network_root = tempfile::tempdir().expect("no network profile root");
+        let no_network_engine =
+            policy_engine_with_selection(no_network_root.path(), Some("workspace"), None);
+        let no_network = authorize_command_request(
+            &no_network_engine,
+            &default_cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: true_path.clone(),
+                args: vec![],
+                cwd: None,
+                env: forwarded_env.clone(),
+            },
+        );
+        let no_network_plan = no_network.plan.expect("bubblewrap plan");
+        assert!(
+            no_network_plan
+                .invocation
+                .environment
+                .keys()
+                .all(|name| !name.to_ascii_lowercase().ends_with("_proxy"))
+        );
+        assert_eq!(
+            no_network_plan
+                .invocation
+                .environment
+                .get("FLAG")
+                .map(String::as_str),
+            Some("kept")
+        );
+
+        let baffle_root = tempfile::tempdir().expect("Baffle profile root");
+        let baffle_engine = policy_engine_with_selection(
+            baffle_root.path(),
+            Some("workspace"),
+            Some("session.toml"),
+        );
+        let baffle = authorize_command_request(
+            &baffle_engine,
+            &default_cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: true_path,
+                args: vec![],
+                cwd: None,
+                env: forwarded_env,
+            },
+        );
+        let baffle_plan = baffle.plan.expect("Baffle plan");
+        for name in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+            assert_eq!(
+                baffle_plan
+                    .invocation
+                    .environment
+                    .get(name)
+                    .map(String::as_str),
+                Some("http://127.0.0.1:3128")
+            );
+        }
+        assert!(baffle_plan.invocation.environment.keys().all(|name| {
+            !name.to_ascii_lowercase().ends_with("_proxy")
+                || ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]
+                    .contains(&name.as_str())
+        }));
+    }
+
+    #[tokio::test]
+    async fn explicit_unimplemented_bubblewrap_never_falls_back_to_direct() {
+        let true_path = find_executable("true").expect("true executable");
+        let root = tempfile::tempdir().expect("profile root");
+        let engine = policy_engine_with_selection(root.path(), Some("workspace"), None);
+        let error = run_command_with_backend(
+            &engine,
+            default_cwd_for_tests().as_path(),
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: true_path,
+                args: vec![],
+                cwd: None,
+                env: None,
+            },
+        )
+        .await
+        .expect_err("Bubblewrap backend must not use direct execution");
+        assert!(
+            matches!(error, ToolError::BackendUnavailable { backend } if backend == "bubblewrap")
+        );
     }
 
     #[cfg(unix)]
@@ -733,6 +1220,7 @@ mod tests {
             resolve_executable_in_path("cargo", temp.path().as_os_str()).expect("resolve");
 
         assert_eq!(resolved, link_path.to_string_lossy());
+        assert!(Path::new(&resolved).is_absolute());
     }
 
     #[cfg(all(target_os = "linux", unix))]
@@ -754,9 +1242,9 @@ mod tests {
         let policy_module = format!(
             r#"package sandbox.main
 
-default allow = false
+default decision := {{"allow": false, "filesystem": null, "baffle_session": null}}
 
-allow if {{
+decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
   input.command == "./hello"
   input.path == {}
   input.cwd == {}
@@ -985,7 +1473,7 @@ allow if {{
         let cwd_with_redundant_slashes = format!("{}/", cwd.to_string_lossy());
         let cwd_label = cwd.to_string_lossy().into_owned();
         let module = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nexpected_keys := {{\"args\", \"command\", \"cwd\", \"env\", \"hash\", \"path\"}}\n\nallow if {{\n  input.command == {}\n  input.cwd == {}\n  object.keys(input) == expected_keys\n}}\n",
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\nexpected_keys := {{\"args\", \"command\", \"cwd\", \"env\", \"hash\", \"path\"}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  input.command == {}\n  input.cwd == {}\n  object.keys(input) == expected_keys\n}}\n",
             serde_json::to_string(&script).expect("script string"),
             serde_json::to_string(&cwd_label).expect("cwd string"),
         );
@@ -1017,7 +1505,7 @@ allow if {{
         let script = script_path.to_string_lossy().into_owned();
         let cwd_label = cwd.to_string_lossy().into_owned();
         let module = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nallow if {{\n  input.command == {}\n  input.cwd == {}\n}}\n",
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  input.command == {}\n  input.cwd == {}\n}}\n",
             serde_json::to_string(&script).expect("script string"),
             serde_json::to_string(&cwd_label).expect("cwd string"),
         );

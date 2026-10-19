@@ -17,8 +17,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::execution::ExecutionBackend;
 use crate::executor::{
-    RunCommandCheckOutput, RunCommandInput, ToolError, check_command, spawn_command_process,
+    RunCommandCheckOutput, RunCommandInput, ToolError, check_command_with_backend,
+    spawn_command_process_with_backend,
 };
 use crate::policy::PolicyEngine;
 
@@ -26,6 +28,7 @@ use crate::policy::PolicyEngine;
 pub struct RawEndpointState {
     pub policy_engine: Arc<PolicyEngine>,
     pub default_cwd: PathBuf,
+    pub backend: ExecutionBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +103,12 @@ pub async fn raw_handler(
     let executable = input.executable.clone();
     let args_for_log = input.args.clone();
 
-    let mut child = match spawn_command_process(&state.policy_engine, &state.default_cwd, input) {
+    let mut child = match spawn_command_process_with_backend(
+        &state.policy_engine,
+        &state.default_cwd,
+        state.backend,
+        input,
+    ) {
         Ok(child) => child,
         Err(ToolError::Validation(error)) => {
             tracing::warn!(command = %executable, args = ?args_for_log, error = %error, "raw request denied by policy");
@@ -174,8 +182,12 @@ pub async fn check_handler(
 
     let executable = input.executable.clone();
     let args_for_log = input.args.clone();
-    let decision: RunCommandCheckOutput =
-        check_command(&state.policy_engine, &state.default_cwd, input);
+    let decision: RunCommandCheckOutput = check_command_with_backend(
+        &state.policy_engine,
+        &state.default_cwd,
+        state.backend,
+        input,
+    );
 
     tracing::info!(
         command = %executable,
@@ -416,7 +428,7 @@ mod tests {
         }
 
         let main = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nallowed_commands := {{\n{allowed_map}}}\n\nallow if {{\n  allowed_commands[input.command]\n}}\n"
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\nallowed_commands := {{\n{allowed_map}}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  allowed_commands[input.command]\n}}\n"
         );
 
         PolicyEngine::from_rego_for_tests(&[("main.rego", &main)])
@@ -645,6 +657,9 @@ mod tests {
         assert!(decision.hash.is_some());
         assert_eq!(decision.cwd.as_deref(), Some(expected_cwd.as_str()));
         assert_eq!(decision.policy_mode, "rego");
+        assert_eq!(decision.filesystem, None);
+        assert_eq!(decision.baffle_session, None);
+        assert_eq!(decision.backend, "direct");
 
         server_task.abort();
     }
