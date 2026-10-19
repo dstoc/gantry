@@ -276,6 +276,17 @@ trait ExecutionBackend {
 
 The filesystem decision selects the backend: a named filesystem profile selects Bubblewrap, while `filesystem: null` selects Direct when enabled by trusted Gantry configuration. Direct keeps the current `tokio::process::Command` behavior. Future backends may implement named profiles, but failed Bubblewrap execution never falls back to Direct.
 
+### Backend selection matrix
+
+| Filesystem decision | Baffle session | Backend | Result |
+| --- | --- | --- | --- |
+| Named profile | null | Bubblewrap | Isolated; no external network |
+| Named profile | filename | Bubblewrap | Isolated; per-command Baffle proxy |
+| null | null | Direct | Current Gantry command execution, if enabled |
+| null | filename | Denied | Direct does not support per-command Baffle sessions |
+
+Direct is a deliberate policy selection; no backend failure changes a named filesystem decision into Direct.
+
 Use capability validation before provisioning. Concurrent runs must each retain their own immutable policy/profile snapshot and execution ownership.
 
 ## 5. Bubblewrap backend
