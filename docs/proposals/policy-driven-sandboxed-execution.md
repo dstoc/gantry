@@ -423,9 +423,10 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 **Deliverable:** a policy-only dry run showing selected source paths and Baffle configuration file.
 
-### Phase 2 — Backend abstraction and Bubblewrap filesystem isolation
+### Phase 2 — Direct and Bubblewrap execution backends
 
 - Introduce `ExecutionBackend` and `RunningExecution` lifecycle types.
+- Implement Direct by retaining Gantry's current process spawn and lifecycle.
 - Implement isolated per-command Bubblewrap execution without external networking.
 - Implement simple authorized-invocation handoff to the supervisor without a new executable lookup; use the authorized CWD path and preserve output and cancellation semantics.
 - Add filesystem and namespace escape tests.
