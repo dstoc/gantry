@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.8"
-baffle-client = { git = "https://github.com/dstoc/baffle", rev = "c99af79a51089555896648dd3307b96fecd1d0db" }
+baffle-client = "2.0.0"
 base64 = "0.22.1"
 futures-util = "0.3.31"
 libc = "0.2.177"
@@ -18,13 +18,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 thiserror = "2.0.18"
+tempfile = "3.25.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-stream = "0.1.17"
 toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 rcgen = { version = "=0.14.10", features = ["x509-parser"] }
-tempfile = "3.25.0"
 tokio-rustls = "=0.26.5"

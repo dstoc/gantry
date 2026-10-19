@@ -696,8 +696,6 @@ mod tests {
             "GANTRY_POLICY_DIR" => Some("/env/policies".to_string()),
             "GANTRY_BACKEND" => Some("bubblewrap".to_string()),
             "GANTRY_BAFFLE_CONTROL_SOCKET" => Some("/var/run/baffle/control.sock".to_string()),
-            "GANTRY_BAFFLE_SESSION_SOCKET_DIR" => Some("/var/run/baffle/proxies".to_string()),
-            "GANTRY_BAFFLE_CA_CERT" => Some("/var/lib/baffle/ca.pem".to_string()),
             _ => None,
         })
         .expect("valid GANTRY server environment");
@@ -710,14 +708,6 @@ mod tests {
         assert_eq!(
             config.baffle.control_socket,
             PathBuf::from("/var/run/baffle/control.sock")
-        );
-        assert_eq!(
-            config.baffle.session_socket_dir,
-            PathBuf::from("/var/run/baffle/proxies")
-        );
-        assert_eq!(
-            config.baffle.ca_certificate,
-            Some(PathBuf::from("/var/lib/baffle/ca.pem"))
         );
     }
 

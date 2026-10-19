@@ -430,6 +430,10 @@ mod tests {
         let control_listener = UnixListener::bind(&control_path).expect("control listener");
         let _session_listener = UnixListener::bind(&session_path).expect("session listener");
         let response_socket = session_path.clone();
+        let ca_certificate_pem = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("test CA certificate")
+            .cert
+            .pem();
         let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         let daemon = tokio::spawn(async move {
@@ -453,7 +457,8 @@ mod tests {
                 "result": {
                     "id": "startup-cancellation-session",
                     "socket": response_socket,
-                    "persistent": false
+                    "persistent": false,
+                    "ca_certificate_pem": ca_certificate_pem
                 }
             }))
             .expect("response JSON");
@@ -479,8 +484,6 @@ mod tests {
         let lease = crate::baffle::create_ephemeral_session(
             &crate::baffle::BaffleRuntimeConfig {
                 control_socket: control_path,
-                session_socket_dir: directory.path().to_path_buf(),
-                ca_certificate: None,
             },
             "startup-test.toml",
         )

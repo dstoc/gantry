@@ -37,7 +37,7 @@ jobs:
               apt-get update
               apt-get install --yes bubblewrap curl gcc cmake clang libclang-dev pkg-config git
               git clone --no-checkout https://github.com/dstoc/baffle.git /tmp/baffle
-              git -C /tmp/baffle checkout c99af79a51089555896648dd3307b96fecd1d0db
+              git -C /tmp/baffle checkout v2.0.0
               cd /tmp/baffle
               RUSTFLAGS="--cfg baffle_integration_test" cargo build --locked --bin baffle
               cd /workspace
