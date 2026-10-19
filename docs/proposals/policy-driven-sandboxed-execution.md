@@ -94,13 +94,13 @@ package sandbox.main
 default decision := {
     "allow": false,
     "filesystem": null,
-    "network": null,
+    "baffle_session": null,
 }
 
 decision := {
     "allow": true,
     "filesystem": "workspace-readonly",
-    "network": "github-readonly",
+    "baffle_session": "github-readonly.toml",
 } if {
     input.command == "gh"
     count(input.args) >= 2
@@ -112,7 +112,7 @@ decision := {
 decision := {
     "allow": true,
     "filesystem": "workspace-write",
-    "network": null,
+    "baffle_session": null,
 } if {
     input.command == "cargo"
     input.args == ["test"]
@@ -123,13 +123,13 @@ decision := {
 | --- | --- | --- |
 | `allow` | boolean | Required; only `true` permits execution. |
 | `filesystem` | string or null | Required string for authorized invocations; names a trusted filesystem profile. |
-| `network` | string or null | Required; `null` means no external network, otherwise names a trusted network profile. |
+| `baffle_session` | string or null | Required; `null` means no external network, otherwise names a trusted Baffle session configuration file relative to `session_config_dir`. |
 
-For a denied decision, only `allow: false` has effect. For an allowed decision, an unknown/empty/invalid filesystem name, unknown network name, undefined result, malformed type, or multiple conflicting decisions must deny the invocation. **There is no implicit unrestricted filesystem or network policy.**
+For a denied decision, only `allow: false` has effect. For an allowed decision, an unknown/empty/invalid filesystem name, invalid or missing Baffle session filename, undefined result, malformed type, or multiple conflicting decisions must deny the invocation. **There is no implicit unrestricted filesystem or network policy.**
 
 Evaluate authorization and profile selection together, not as unrelated queries against potentially different policy generations. Preserve command-specific `data.sandbox[...].allow` modules where useful by adapting the router policy. Retaining `sandbox` avoids coupling this change to an unrelated Rego package rename; changing the package name can be a separate migration.
 
-Rego must not return raw filesystem paths, mount flags, Baffle credentials, or already-created Baffle session identifiers. The caller's request shape stays unchanged.
+Rego must not return raw filesystem paths, mount flags, Baffle credentials, or runtime-created session IDs. It selects only a trusted Baffle **configuration filename**. The caller's request shape stays unchanged.
 
 ### Checks
 
@@ -140,22 +140,23 @@ Rego must not return raw filesystem paths, mount flags, Baffle credentials, or a
   "allowed": true,
   "reason": null,
   "filesystem": "workspace-readonly",
-  "network": "github-readonly",
+  "baffle_session": "github-readonly.toml",
   "backend": "bubblewrap"
 }
 ```
 
-A check may validate static profile existence/schema and backend compatibility, but **must not** create a Baffle session, mount filesystems, or launch Bubblewrap. It remains advisory and point-in-time: the real execution reauthorizes and may fail during provisioning. Explicitly document migration from the current boolean `allow` contract. A compatibility mode, if offered, must not imply an unrestricted filesystem by default.
+A check may validate filesystem-profile existence/schema, Baffle filename syntax and backend compatibility, but **must not** create a Baffle session, mount filesystems, or launch Bubblewrap. It remains advisory and point-in-time: the real execution reauthorizes and may fail during provisioning. Explicitly document migration from the current boolean `allow` contract. A compatibility mode, if offered, must not imply an unrestricted filesystem by default.
 
-## 2. Filesystem policies and trusted resources
+## 2. Filesystem policies with direct source paths
 
 ### Named declarative profiles
 
-Suggested configuration layout (paths and exact schema to be finalized):
+Rego selects a named filesystem profile. Each administrator-controlled profile specifies **source paths directly**; there is no additional named-resource registry or resource-to-path mapping.
+
+Proposed layout:
 
 ```text
 config/
-  gantry.toml
   policies/
     main.rego
     gh.rego
@@ -172,64 +173,59 @@ Example `filesystems/workspace-readonly.toml`:
 version = 1
 
 [[mounts]]
-kind = "resource"
-resource = "workspace"
+source = "/srv/workspace"
 target = "/workspace"
 access = "read-only"
 
 [[mounts]]
-kind = "tmpfs"
+type = "tmpfs"
 target = "/tmp"
 size = "256MiB"
 ```
 
-A writable profile may use `access = "read-write"` for an explicitly writable resource. Other initial mount kinds may include empty directories; do not introduce arbitrary filesystem overlays or copy-on-write implicitly.
+A writable profile can specify `access = "read-write"`. Paths are absolute **within the trusted Gantry runtime**, not necessarily on the physical host. No untrusted caller or Rego expression may supply or override source paths, destinations, or access modes; Rego selects only the profile name.
 
-### Resource ceiling
+### Path validation and mount safety
 
-Resources are declared separately by the trusted Gantry operator, for example:
-
-```toml
-[resources.workspace]
-path = "/srv/workspace"
-max_access = "read-write"
-```
-
-The filesystem profile selects a subset of previously configured resources and may request **no more access** than their maximum declared permissions. It cannot reference arbitrary host paths supplied by the command or dynamically computed by Rego. Multiple profiles can share resource names without duplicating the underlying path configuration.
-
-The term "host path" here is relative to Gantry's own trusted runtime filesystem, not necessarily the physical machine's filesystem. Gantry cannot expose resources beyond those available to its process.
+- Parse profiles only from administrator-controlled files.
+- Resolve source paths in trusted code; reject traversal, symlink races, unsafe file types, conflicting targets and protected-target shadowing.
+- Pin opened source objects before applying mounts, preferably with Bubblewrap's descriptor-based `--bind-fd`/`--ro-bind-fd` (where available) or another race-resistant equivalent. Validate backend version and required capabilities; fail closed if unavailable.
+- Read-only mounts constrain writes *from the command* but do not freeze changes by other processes. Consider nested mounts and unintended writable submounts.
+- Filesystem profiles are **allowlists**; they are not mounted on top of an inherited unrestricted root filesystem.
 
 ### Minimal trusted runtime root
 
-The execution backend must construct a limited runtime view for program execution: selected executable and libraries, essential runtime files, a suitable `/proc` view, and private temporary state. This trusted baseline is *not* the entirety of the parent container's root filesystem and must not expose credentials, control sockets, or unrelated application data.
+The backend must construct a limited runtime view containing the authorized executable, required interpreter/libraries, essential system files, a suitable `/proc`, and private temporary state. This baseline is not the entire parent filesystem and must not expose credentials, control sockets, or unrelated application data.
 
-A selected filesystem profile adds explicit resources to that baseline. Runtime dependencies and environment-specific filesystem setup should be documented as a separate, administrator-controlled part of Gantry configuration. If the authorized executable or cwd cannot be made available without expanding access, fail.
+A selected profile adds only its declared direct-path mounts to that baseline. If the authorized executable or cwd cannot be represented without expanding access, reject execution.
 
 ### Filesystem invariants
 
-- Resolve resource names and filesystem policy definitions in trusted code.
-- Reject unsafe sources, symlinks, traversal, overlapping mounts, and protected-target shadowing unless a precisely defined, safe ordering exists.
-- Preserve source identity across validation and mount setup; prefer fd-based resolution where available.
-- Preserve the existing **fd-resolved cwd guarantee** documented in `docs/cwd-policy-guarantees.md`: execution must use the directory that policy evaluated, accounting for namespace translation.
-- Execute the same authorized executable object or prove equivalence across the sandbox boundary; do not authorize one host path and execute an attacker-substituted path inside the sandbox.
-- Scrub inherited descriptors and environment variables which could grant access outside selected resources.
-- Writable mounts are genuinely writable; edits to those resources are not assumed to be disposable.
+- Ensure authorized mount sources correspond to the objects actually mounted, avoiding re-resolution through mutable paths.
+- Preserve the existing fd-resolved CWD guarantee from `docs/cwd-policy-guarantees.md`: map the authorized directory object safely inside the namespace and use its corresponding sandbox path. Do **not** leak a parent-namespace CWD fd to the untrusted command.
+- Execute the immutable authorized executable snapshot described in §5, never a second resolution of the original path.
+- Scrub inherited file descriptors and environment variables.
+- Writable mounts are genuinely writable and need not be disposable.
 
-## 3. Network policies and Baffle sessions
+## 3. Direct Baffle session selection
 
-### Named network profiles
+### Rego selects a configuration filename
 
-A network profile is a trusted mapping from a Rego-selected name to a provider and its administrator-managed configuration:
+**Baffle is the only network integration in scope.** There is no general network-provider abstraction and no Gantry network-profile mapping layer.
 
-```toml
-[networks.github-readonly]
-provider = "baffle"
-session = "github-readonly.toml"
+The Rego decision's `baffle_session` is either `null` (no network) or a filename relative to Baffle's administrator-controlled `session_config_dir`:
+
+```json
+{
+  "allow": true,
+  "filesystem": "workspace-readonly",
+  "baffle_session": "github-readonly.toml"
+}
 ```
 
-The session path is a **Baffle file-only configuration name** (relative to Baffle's configured `session_config_dir`), not a session ID, secret, or free-form user-supplied policy. Baffle resolves, validates, and snapshots the actual v2 TOML file.
+This is a Baffle **session configuration filename**, not the runtime-generated Baffle session ID or socket path. Gantry validates the name and Baffle performs its file-only ownership, symlink and contents checks when creating the session. The filename comes from Rego, never the untrusted command request.
 
-Example Baffle session file:
+Example Baffle configuration:
 
 ```toml
 version = 2
@@ -240,28 +236,17 @@ unmatched = "deny"
 paths = ["/repos/dstoc/**"]
 ```
 
-Omit `socket_name` for per-command profiles so concurrently provisioned sessions receive generated, unique paths. A non-null network selection requires successful session creation before command start. A null network selection creates no Baffle session and provides no external network.
+Omit `socket_name` so concurrently provisioned sessions receive unique data socket paths. Require ephemeral sessions; failed provisioning prevents command startup.
 
-### Trusted Baffle provider
+### Trusted Baffle integration
 
-Introduce a provider abstraction (illustrative Rust):
+Gantry uses Baffle's existing `baffle-client` and `create_from_file` operation directly. If deployment requires a privileged broker, it exposes a constrained create/lease interface but **does not** introduce another network provider or policy mapping.
 
-```rust
-trait NetworkSessionProvider {
-    async fn create(&self, profile: &NetworkProfile)
-        -> Result<NetworkSession>;
-}
-```
+Trusted Gantry execution state holds the ephemeral session lease for the complete command/process-tree lifetime, releasing it on success, cancellation, spawn failure and unexpected termination. Only the assigned Baffle **data** socket is exposed inside the sandbox; never the control socket or credentials.
 
-The initial provider uses Baffle's existing `baffle-client` and `create_from_file` operation, either over a trusted direct control UDS or via a trusted broker. These deployment options remain interchangeable behind the interface. Gantry must **never expose the Baffle control socket or injected secret material to the command**.
+### No session means no external network
 
-An ephemeral Baffle session is leased over the create control connection; keep the returned handle alive for the whole workload. Require `persistent = false`, verify the created session is ephemeral, and fail (and clean up) if it is not. Close the lease after normal completion, cancellation, spawn failure, or unexpected termination. Baffle handles its own session socket removal on lease release.
-
-The provider returns a typed leased endpoint and does not make any command network connections. The execution backend receives only the selected data endpoint, not provider control authority.
-
-### No network means no network
-
-With `network: null`, use a private network namespace with no external routes or inherited reachable external interfaces. Do not provide any proxy socket or proxy environment. A private loopback interface may be used for processes within that invocation. Caller-provided proxy variables and bypass controls must not override these restrictions.
+With `baffle_session: null`, the command still runs in an isolated network namespace, without an external route, any Baffle socket, or injected proxy configuration. Private loopback may be used within the invocation. Caller-supplied proxy and bypass environment variables cannot override this restriction.
 
 ## 4. Pluggable execution backends
 
@@ -373,7 +358,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
 | Executable/CWD | Same object and opened cwd are used after authorization; no substitution across mounts or namespace transitions. |
-| Network | `network: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
+| Network | `baffle_session: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
 | Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
