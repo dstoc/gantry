@@ -18,7 +18,7 @@ Every command runs with a new isolation boundary, including commands for which R
 
 ## Motivation and existing behaviour
 
-Gantry currently evaluates a boolean Rego query, `data.sandbox.main.allow`, then executes the resolved command directly using `tokio::process::Command`. Rego can inspect the requested command, resolved path, executable SHA-256, arguments, forwarded environment, and a trusted working-directory label. The `POST /check` and MCP `check_command` paths share pre-spawn authorization with actual execution.
+Gantry currently evaluates a boolean Rego query, `data.sandbox.main.allow`, then executes the resolved command directly using `tokio::process::Command`. Rego can inspect the requested command, resolved path, executable SHA-256, arguments, forwarded environment, and a trusted working-directory label. The `POST /check` and MCP `check_command` paths share pre-spawn authorization with actual execution. The new design must preserve that logical authorization path while moving spawning into a supervisor.
 
 A boolean approval alone cannot distinguish a command allowed to read a checkout, one allowed to change it, or one permitted to contact a narrowly specified API with injected credentials. Nor can a shared parent-container proxy provide independent network authority to two simultaneous commands when either can connect to the same socket or listener.
 
@@ -348,13 +348,13 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 - Preserve existing MCP command output and `/raw` stdout/stderr streaming, output limits, exit codes and disconnect semantics.
 - Refactor synchronous `spawn_command_process` and the shared authorization path as needed because Baffle provisioning and backend startup are asynchronous. Keep authorization shared between all execution paths.
 - Introduce structured decision migration documentation from `data.sandbox.main.allow`; explicit migration is preferable to retaining insecure default execution semantics.
-- Retain deny-all behaviour on policy startup/reload errors. Load Rego, filesystem profiles, resource mappings and network mappings into coherent immutable generations; do not combine values from incompatible reload generations.
+- Retain deny-all behaviour on policy startup/reload errors. Load Rego and direct-path filesystem profiles into coherent immutable generations; validate Baffle filenames against the configured session directory before provisioning; do not combine values from incompatible reload generations.
 
 ## 7. Security acceptance requirements
 
 **Authorization:** one Rego decision, from verified input, selects no caller-controlled resource paths or proxy sessions. Reject malformed/unknown values. Retain executable hash and fd-resolved cwd guarantees through the namespace boundary.
 
-**Filesystem:** only declared trusted resources and a minimal runtime baseline are accessible. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
+**Filesystem:** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
 
 **Network:** no direct external route, reachable parent proxy, or cross-command proxy connection. The selected Baffle UDS is the sole external-egress capability. No control socket or credential secret is visible inside the sandbox. Proxy failures never trigger direct fallback.
 
@@ -366,10 +366,10 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 
 | Area | Essential tests |
 | --- | --- |
-| Rego | Allow/deny, differing filesystem/network selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
+| Rego | Allow/deny, differing filesystem/Baffle-file selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
 | `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
-| Executable/CWD | Same object and opened cwd are used after authorization; no substitution across mounts or namespace transitions. |
+| Executable/CWD | Hash and execute the same immutable executable snapshot; verify pathname swaps, in-place executable overwrites, interpreter cases and authorized cwd mounting. |
 | Network | `baffle_session: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
@@ -386,30 +386,31 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 - Bind only a live Baffle pathname UDS into the child namespace and successfully proxy HTTPS CONNECT through it.
 - Prove unwanted parent socket/network access is blocked.
 - Test process-tree cleanup and lease loss when the parent dies.
+- Prove that the supervisor executes sealed, authorized bytes and that cwd and interpreter rules survive the namespace transition.
 
 **Deliverable:** documented compatibility findings and any required kernel/container prerequisites. If critical assumptions fail, adjust the enforcement design before implementing the full backend.
 
 ### Phase 1 — Structured policy and profiles
 
 - Implement the structured Rego result and migration from boolean `allow`.
-- Define trusted resource and filesystem profile schemas, network mappings and validation.
-- Build an immutable validated `ExecutionPlan` for each invocation.
+- Define direct-path filesystem profile schema, Baffle configuration filename validation, and policy reload consistency.
+- Build an immutable validated `ExecutionPlan` with sealed executable snapshot and authorized cwd mapping.
 - Extend `/check` and tests without side effects.
 
-**Deliverable:** a policy-only dry run showing authorized resources and selected isolation requirements.
+**Deliverable:** a policy-only dry run showing selected source paths and Baffle configuration file.
 
 ### Phase 2 — Backend abstraction and Bubblewrap filesystem isolation
 
 - Introduce `ExecutionBackend` and `RunningExecution` lifecycle types.
 - Implement isolated per-command Bubblewrap execution without external networking.
-- Preserve executable/CWD identity, output and cancellation semantics.
+- Implement sealed executable/manifest handoff and preserve authorized CWD, output and cancellation semantics.
 - Add filesystem and namespace escape tests.
 
 **Deliverable:** authorized commands run in isolated, no-network filesystem environments.
 
 ### Phase 3 — Per-command Baffle integration
 
-- Implement the trusted Baffle provider and ephemeral lease ownership.
+- Integrate Baffle's existing client directly and implement ephemeral lease ownership.
 - Implement `gantry-supervisor` with integrated Tokio TCP-to-UDS forwarding.
 - Expose only the selected data UDS to the command sandbox.
 - Set controlled proxy environment and public CA trust as required.
@@ -430,25 +431,25 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 1. **Trusted runtime root:** How should Gantry define and provision the minimum executable, dynamic libraries and system files while avoiding wholesale exposure of the parent root filesystem?
 2. **Filesystem source integrity:** Which descriptor-based Linux APIs and mount strategy will preserve the authorized executable, cwd and resource identity across Bubblewrap setup?
-3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? Keep the provider API independent of that deployment choice.
+3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
 4. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
 5. **Process-tree termination:** Are PID namespaces plus supervisor signalling sufficient for all supported environments, or does Gantry additionally require cgroups or another reaper mechanism?
-6. **Profile configuration and reload:** Finalize TOML schema, profile filename rules, snapshot changes and explicit migration from the legacy boolean policy.
+6. **Profile configuration and reload:** Finalize direct-path TOML schema, Baffle filename rules, reload consistency, and explicit migration from the legacy boolean policy.
 7. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
 
 ## Final acceptance criteria
 
 This feature is complete when:
 
-- Rego returns exactly one validated object with `allow`, `filesystem` and `network`.
+- Rego returns exactly one validated object with `allow`, `filesystem` and `baffle_session`.
 - Every authorized command requires a named filesystem profile and always runs in an isolated sandbox.
 - Network access is absent by default and never falls back to direct egress.
-- Profiles refer only to administrator-managed trusted resources and Baffle session configurations.
+- Filesystem profiles specify direct administrator-managed mount source paths; Rego selects Baffle session configuration filenames directly.
 - Bubblewrap enforces the selected filesystem, process and network requirements per invocation.
 - Optional Baffle access provisions a unique ephemeral session per command and keeps its lease until execution cleanup.
 - The Rust supervisor supplies the local HTTP proxy via an in-process TCP-to-UDS bridge on `127.0.0.1:3128`, without `socat`.
 - Concurrent commands have independent proxy and filesystem authority.
-- Existing command and check transports preserve their observable output/exit/cancellation contracts, with selected profiles added to check diagnostics.
+- The supervisor launches only the sealed authorized executable snapshot, not a second pathname lookup. Existing command and check transports preserve their observable output/exit/cancellation contracts, with selected filesystem/Baffle names added to check diagnostics.
 - All setup, isolation, provisioning and cleanup failures fail closed.
 - The decision and profile contracts do not mention Bubblewrap and can be implemented by another enforcing backend.
 
