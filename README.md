@@ -48,6 +48,14 @@ The old server variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` are i
 
 Bubblewrap is the default backend. It requires Linux, Bubblewrap with descriptor-based bind support, and the `gantry-supervisor` binary installed beside `gantry`. Each command receives a separate user, mount, PID, and network namespace. A restricted runtime view exposes the authorized executable, its interpreter and shared libraries, private `/proc`, `/tmp`, and `/run`, and only the selected profile mounts. Bubblewrap setup errors fail closed. Use `--backend direct` to explicitly select unsandboxed execution; Direct policies must return `filesystem: null` and `baffle_session: null`.
 
+For a Bubblewrap decision with a non-null `baffle_session`, Gantry calls Baffle's file-only `create_from_file` API and holds the ephemeral lease until the supervisor and bridge stop. Configure the daemon paths with trusted server environment variables:
+
+- `GANTRY_BAFFLE_CONTROL_SOCKET`: Baffle control socket; defaults to Baffle's platform path.
+- `GANTRY_BAFFLE_SESSION_SOCKET_DIR`: Baffle data socket directory; defaults to `/run/baffle/proxies`. Set this to the daemon's `socket_dir` so Gantry can protect every session path.
+- `GANTRY_BAFFLE_CA_CERT`: path to the public Baffle CA certificate. This is required only when policy selects a Baffle session.
+
+Gantry mounts the assigned session socket at `/run/gantry/proxy.sock` and the public CA certificate at `/run/gantry/baffle-ca.pem` only for that command. It removes caller-supplied proxy and CA override variables, then sets the local proxy and certificate paths. Gantry does not read Baffle credentials or session configuration contents. Direct rejects Baffle selections and keeps its ambient network behavior.
+
 Examples:
 
 ```bash

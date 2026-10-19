@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 use crate::backend::{self, StartError};
+use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::{AuthorizedInvocation, ExecutionBackend, ExecutionPlan, RunningExecution};
 use crate::policy::{PolicyEngine, ValidationError};
 
@@ -94,8 +95,31 @@ pub async fn run_command_with_backend(
     backend: ExecutionBackend,
     input: RunCommandInput,
 ) -> Result<RunCommandOutput, ToolError> {
-    let mut execution =
-        start_command_process_with_backend(policy_engine, default_cwd, backend, input).await?;
+    run_command_with_baffle_config(
+        policy_engine,
+        default_cwd,
+        backend,
+        BaffleRuntimeConfig::from_env(),
+        input,
+    )
+    .await
+}
+
+pub async fn run_command_with_baffle_config(
+    policy_engine: &PolicyEngine,
+    default_cwd: &Path,
+    backend: ExecutionBackend,
+    baffle: BaffleRuntimeConfig,
+    input: RunCommandInput,
+) -> Result<RunCommandOutput, ToolError> {
+    let mut execution = start_command_process_with_baffle_config(
+        policy_engine,
+        default_cwd,
+        backend,
+        baffle,
+        input,
+    )
+    .await?;
 
     let stdout = execution
         .take_stdout()
@@ -135,10 +159,28 @@ pub async fn run_command_with_backend(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn start_command_process_with_backend(
     policy_engine: &PolicyEngine,
     default_cwd: &Path,
     backend: ExecutionBackend,
+    input: RunCommandInput,
+) -> Result<RunningExecution, ToolError> {
+    start_command_process_with_baffle_config(
+        policy_engine,
+        default_cwd,
+        backend,
+        BaffleRuntimeConfig::from_env(),
+        input,
+    )
+    .await
+}
+
+pub(crate) async fn start_command_process_with_baffle_config(
+    policy_engine: &PolicyEngine,
+    default_cwd: &Path,
+    backend: ExecutionBackend,
+    baffle: BaffleRuntimeConfig,
     input: RunCommandInput,
 ) -> Result<RunningExecution, ToolError> {
     let authorization = authorize_command_request(policy_engine, default_cwd, backend, input);
@@ -163,7 +205,7 @@ pub(crate) async fn start_command_process_with_backend(
     #[cfg(not(unix))]
     let cwd_fd = -1;
 
-    match backend::start(plan, cwd_fd).await {
+    match backend::start(plan, cwd_fd, baffle).await {
         Ok(execution) => Ok(execution),
         Err(StartError::Spawn(source)) => Err(ToolError::Spawn { source }),
         Err(StartError::Setup(details)) => Err(ToolError::BackendSetup { details }),
@@ -663,10 +705,32 @@ fn build_effective_command_env(
     }
 
     if backend == ExecutionBackend::Bubblewrap {
-        command_env.retain(|key, _| !key.to_ascii_lowercase().ends_with("_proxy"));
+        command_env.retain(|key, _| {
+            let lower = key.to_ascii_lowercase();
+            !lower.contains("proxy")
+                && !matches!(
+                    lower.as_str(),
+                    "ssl_cert_file"
+                        | "ssl_cert_dir"
+                        | "curl_ca_bundle"
+                        | "requests_ca_bundle"
+                        | "node_extra_ca_certs"
+                )
+        });
         if baffle_authorized {
             for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
                 command_env.insert(key.to_string(), "http://127.0.0.1:3128".to_string());
+            }
+            for key in [
+                "SSL_CERT_FILE",
+                "CURL_CA_BUNDLE",
+                "REQUESTS_CA_BUNDLE",
+                "NODE_EXTRA_CA_CERTS",
+            ] {
+                command_env.insert(
+                    key.to_string(),
+                    crate::baffle::SANDBOX_CA_CERTIFICATE.into(),
+                );
             }
         }
     }

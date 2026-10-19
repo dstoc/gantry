@@ -17,6 +17,10 @@ mod linux {
     use tokio::sync::oneshot;
 
     use crate::backend::{StartError, runtime::runtime_files};
+    use crate::baffle::{
+        BaffleRuntimeConfig, BaffleSessionLease, SANDBOX_CA_CERTIFICATE, SANDBOX_SOCKET,
+        create_ephemeral_session,
+    };
     use crate::execution::{ExecutionExitStatus, ExecutionPlan, RunningExecution};
     use crate::filesystem::{FilesystemMount, MountAccess};
 
@@ -29,6 +33,7 @@ mod linux {
         args: &'a [String],
         cwd: &'a Path,
         environment: &'a BTreeMap<String, String>,
+        proxy_socket: Option<&'a Path>,
     }
 
     #[derive(Debug, serde::Deserialize)]
@@ -60,18 +65,31 @@ mod linux {
         is_directory: bool,
     }
 
-    pub async fn start(plan: ExecutionPlan) -> Result<RunningExecution, StartError> {
-        if plan.baffle_session.is_some() {
-            return Err(StartError::Setup(
-                "Bubblewrap Baffle sessions are not available in this phase".to_string(),
-            ));
-        }
+    pub async fn start(
+        plan: ExecutionPlan,
+        baffle: BaffleRuntimeConfig,
+    ) -> Result<RunningExecution, StartError> {
+        plan.validate_compatibility().map_err(StartError::Setup)?;
         let supervisor = find_supervisor().map_err(StartError::Setup)?;
         let bubblewrap = find_bubblewrap().map_err(StartError::Setup)?;
         validate_bubblewrap(&bubblewrap).map_err(StartError::Setup)?;
         let profile = plan.filesystem.as_ref().ok_or_else(|| {
             StartError::Setup("Bubblewrap execution requires a filesystem profile".to_string())
         })?;
+        baffle
+            .validate_profile_sources(profile, None)
+            .map_err(StartError::Setup)?;
+
+        let ca_certificate = if plan.baffle_session.is_some() {
+            Some(
+                baffle
+                    .validate_for_session()
+                    .map_err(StartError::Setup)?
+                    .to_path_buf(),
+            )
+        } else {
+            None
+        };
 
         let mut runtime = runtime_files(&plan.invocation.executable, &supervisor, profile)
             .map_err(StartError::Setup)?;
@@ -134,6 +152,52 @@ mod linux {
             });
         }
 
+        if let Some(ca_certificate) = ca_certificate.as_deref() {
+            let descriptor = open_pinned(ca_certificate, true).map_err(|error| {
+                StartError::Setup(format!(
+                    "failed to pin the configured public Baffle CA certificate: {error}"
+                ))
+            })?;
+            validate_public_ca_certificate(descriptor.as_raw_fd()).map_err(StartError::Setup)?;
+            let is_directory = descriptor_is_directory(descriptor.as_raw_fd())
+                .map_err(|error| StartError::Setup(error.to_string()))?;
+            mounts.push(PinnedMount {
+                target: PathBuf::from(SANDBOX_CA_CERTIFICATE),
+                kind: MountSourceKind::ReadOnly,
+                descriptor,
+                is_directory,
+            });
+        }
+
+        let mut baffle_lease: Option<BaffleSessionLease> = None;
+        if let Some(filename) = plan.baffle_session.as_deref() {
+            let lease = create_ephemeral_session(&baffle, filename)
+                .await
+                .map_err(StartError::Setup)?;
+            baffle
+                .validate_profile_sources(profile, Some(lease.socket_path()))
+                .map_err(StartError::Setup)?;
+            let descriptor = open_pinned(lease.socket_path(), true).map_err(|error| {
+                StartError::Setup(format!(
+                    "failed to pin the assigned Baffle data socket: {error}"
+                ))
+            })?;
+            if !descriptor_is_socket(descriptor.as_raw_fd())
+                .map_err(|error| StartError::Setup(error.to_string()))?
+            {
+                return Err(StartError::Setup(
+                    "Baffle session data endpoint is not a Unix socket".to_string(),
+                ));
+            }
+            mounts.push(PinnedMount {
+                target: PathBuf::from(SANDBOX_SOCKET),
+                kind: MountSourceKind::ReadOnly,
+                descriptor,
+                is_directory: false,
+            });
+            baffle_lease = Some(lease);
+        }
+
         let mut inherited_mount_fds = Vec::with_capacity(mounts.len());
         for (index, mount) in mounts.iter().enumerate() {
             inherited_mount_fds.push(
@@ -150,6 +214,7 @@ mod linux {
         }
 
         let mut command = Command::new(&bubblewrap);
+        let use_baffle_proxy = baffle_lease.is_some();
         build_bubblewrap_args(&mut command, &mounts, profile);
         command
             .arg("--")
@@ -180,14 +245,16 @@ mod linux {
             });
         }
 
-        let mut child = command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             StartError::Setup(format!("failed to start Bubblewrap launcher: {error}"))
         })?;
+        let mut execution = RunningExecution::new_starting(child, true, baffle_lease.take());
         drop(inherited_mount_fds);
         drop(mounts);
 
         let stdin_result = async {
-            let mut stdin = child
+            let mut stdin = execution
+                .child_mut()
                 .stdin
                 .take()
                 .ok_or_else(|| io::Error::other("Bubblewrap launcher stdin pipe is missing"))?;
@@ -196,6 +263,7 @@ mod linux {
                 args: &plan.invocation.args,
                 cwd: &plan.invocation.cwd,
                 environment: &plan.invocation.environment,
+                proxy_socket: use_baffle_proxy.then_some(Path::new(SANDBOX_SOCKET)),
             };
             let bytes = serde_json::to_vec(&message)
                 .map_err(|error| io::Error::other(error.to_string()))?;
@@ -204,21 +272,27 @@ mod linux {
         }
         .await;
         if let Err(error) = stdin_result {
-            terminate_launcher(&mut child).await;
+            terminate_launcher(execution.child_mut()).await;
             return Err(StartError::Setup(format!(
                 "failed to send the authorized invocation to the Bubblewrap supervisor: {error}"
             )));
         }
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            StartError::Setup("Bubblewrap supervisor stdout pipe is missing".to_string())
-        })?;
+        let stdout = match execution.child_mut().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_launcher(execution.child_mut()).await;
+                return Err(StartError::Setup(
+                    "Bubblewrap supervisor stdout pipe is missing".to_string(),
+                ));
+            }
+        };
         let mut status_reader = BufReader::new(stdout);
         let mut line = String::new();
         let read_result = status_reader.read_line(&mut line).await;
         let status = match read_result {
             Ok(0) => {
-                let diagnostics = launcher_diagnostics(&mut child).await;
+                let diagnostics = launcher_diagnostics(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap exited before the authorized command started{diagnostics}"
                 )));
@@ -226,14 +300,14 @@ mod linux {
             Ok(_) => match serde_json::from_str::<SupervisorMessage>(&line) {
                 Ok(status) => status,
                 Err(error) => {
-                    terminate_launcher(&mut child).await;
+                    terminate_launcher(execution.child_mut()).await;
                     return Err(StartError::Setup(format!(
                         "Bubblewrap supervisor returned an invalid startup status: {error}"
                     )));
                 }
             },
             Err(error) => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "failed to read Bubblewrap supervisor startup status: {error}"
                 )));
@@ -242,13 +316,13 @@ mod linux {
         match status {
             SupervisorMessage::Started => {}
             SupervisorMessage::SetupError { error } => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap command startup failed: {error}"
                 )));
             }
             _ => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(
                     "Bubblewrap supervisor returned an unexpected startup status".to_string(),
                 ));
@@ -269,17 +343,13 @@ mod linux {
             let _ = final_status_tx.send(result);
         });
         let stdout: crate::execution::OutputReader = Box::new(stdout_reader);
-        let stderr = child
+        let stderr = execution
+            .child_mut()
             .stderr
             .take()
             .map(|reader| Box::new(reader) as crate::execution::OutputReader);
-        Ok(RunningExecution::new_with_streams(
-            child,
-            true,
-            Some(stdout),
-            stderr,
-            final_status_rx,
-        ))
+        execution.set_streams(Some(stdout), stderr, final_status_rx);
+        Ok(execution)
     }
 
     async fn forward_supervisor_output<R, W>(
@@ -372,6 +442,12 @@ mod linux {
             .arg("/proc")
             .arg("--tmpfs")
             .arg("/run");
+        if mounts
+            .iter()
+            .any(|mount| mount.target.starts_with("/run/gantry"))
+        {
+            command.arg("--dir").arg("/run/gantry");
+        }
 
         let mut has_tmpfs = false;
         for mount in &profile.mounts {
@@ -574,6 +650,51 @@ mod linux {
         }
     }
 
+    fn descriptor_is_socket(fd: RawFd) -> io::Result<bool> {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(stat.st_mode & libc::S_IFMT == libc::S_IFSOCK)
+    }
+
+    fn validate_public_ca_certificate(fd: RawFd) -> Result<(), String> {
+        let contents = fs::read(format!("/proc/self/fd/{fd}")).map_err(|error| {
+            format!("failed to read the configured Baffle CA certificate: {error}")
+        })?;
+        let text = std::str::from_utf8(&contents)
+            .map_err(|_| "configured Baffle CA certificate is not UTF-8 PEM".to_string())?;
+        if text.contains("PRIVATE KEY") {
+            return Err(
+                "configured Baffle CA file contains private key material; only public certificates can be mounted".to_string(),
+            );
+        }
+
+        let mut remainder = text.trim();
+        let mut certificates = 0;
+        while !remainder.is_empty() {
+            let Some(block) = remainder.strip_prefix("-----BEGIN CERTIFICATE-----") else {
+                return Err(
+                    "configured Baffle CA file must contain only public certificate PEM blocks"
+                        .to_string(),
+                );
+            };
+            let end = block.find("-----END CERTIFICATE-----").ok_or_else(|| {
+                "configured Baffle CA certificate has an incomplete PEM block".to_string()
+            })?;
+            remainder = block[end + "-----END CERTIFICATE-----".len()..].trim();
+            certificates += 1;
+        }
+        if certificates == 0 {
+            return Err(
+                "configured Baffle CA file must contain at least one public certificate"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn duplicate_inheritable(fd: RawFd, minimum: RawFd) -> io::Result<OwnedFd> {
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
         if duplicate < 0 {
@@ -623,6 +744,7 @@ pub(super) use linux::start;
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn start(
     _plan: crate::execution::ExecutionPlan,
+    _baffle: crate::baffle::BaffleRuntimeConfig,
 ) -> Result<crate::execution::RunningExecution, crate::backend::StartError> {
     Err(crate::backend::StartError::Setup(
         "Bubblewrap execution is supported only on Linux".to_string(),

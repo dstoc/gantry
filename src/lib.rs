@@ -5,6 +5,7 @@
 compile_error!("gantry supports Linux and macOS targets on x86_64 and aarch64 only.");
 
 mod backend;
+mod baffle;
 mod execution;
 mod executor;
 mod filesystem;
@@ -13,11 +14,12 @@ mod policy;
 mod raw;
 mod remote;
 
+pub use baffle::BaffleRuntimeConfig;
 pub use execution::ExecutionBackend;
 pub use executor::{
     MAX_OUTPUT_BYTES, RunCommandCheckOutput, RunCommandInput, RunCommandOutput, TRUNCATION_MARKER,
     ToolError, check_command, check_command_with_backend, run_command_impl,
-    run_command_with_backend,
+    run_command_with_backend, run_command_with_baffle_config,
 };
 pub use mcp::{
     AppConfig, AppError, ConfigError, DEFAULT_BIND_ADDR, McpRunServer, build_app,

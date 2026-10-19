@@ -5,6 +5,7 @@ mod runtime;
 use std::io;
 use std::os::fd::RawFd;
 
+use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::{ExecutionBackend, ExecutionPlan, RunningExecution};
 
 pub(crate) enum StartError {
@@ -15,10 +16,11 @@ pub(crate) enum StartError {
 pub(crate) async fn start(
     plan: ExecutionPlan,
     trusted_cwd_fd: RawFd,
+    baffle: BaffleRuntimeConfig,
 ) -> Result<RunningExecution, StartError> {
     match plan.backend {
         ExecutionBackend::Direct => direct::start(plan, trusted_cwd_fd),
-        ExecutionBackend::Bubblewrap => bubblewrap::start(plan).await,
+        ExecutionBackend::Bubblewrap => bubblewrap::start(plan, baffle).await,
     }
 }
 

@@ -13,10 +13,11 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
 use thiserror::Error;
 
+use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::ExecutionBackend;
 use crate::executor::{
     RunCommandCheckOutput, RunCommandInput, RunCommandOutput,
-    check_command_with_backend as check_command_impl, run_command_with_backend,
+    check_command_with_backend as check_command_impl, run_command_with_baffle_config,
 };
 use crate::policy::{PolicyEngine, PolicyMode};
 use crate::raw::{RawEndpointState, check_handler, raw_handler};
@@ -29,6 +30,7 @@ pub struct AppConfig {
     pub bind_uds: Option<PathBuf>,
     pub policy_dir: Option<PathBuf>,
     pub backend: ExecutionBackend,
+    pub baffle: BaffleRuntimeConfig,
     pub default_cwd: PathBuf,
 }
 
@@ -150,6 +152,10 @@ impl AppConfig {
                 .map(PathBuf::from)
         };
         let backend = cli_backend.unwrap_or(ExecutionBackend::Bubblewrap);
+        let baffle = BaffleRuntimeConfig::from_lookup(|name| lookup(name).map(PathBuf::from));
+        baffle
+            .validate_paths()
+            .map_err(|details| ConfigError::InvalidBaffleConfig { details })?;
         let default_cwd =
             std::env::current_dir().map_err(|source| ConfigError::CurrentDir { source })?;
         validate_default_cwd(&default_cwd)?;
@@ -159,6 +165,7 @@ impl AppConfig {
             bind_uds,
             policy_dir,
             backend,
+            baffle,
             default_cwd,
         })
     }
@@ -239,6 +246,8 @@ pub enum ConfigError {
     MissingArgumentValue(String),
     #[error("{details}")]
     InvalidBackend { details: String },
+    #[error("{details}")]
+    InvalidBaffleConfig { details: String },
     #[error("invalid GANTRY_BIND_ADDR '{value}': {source}")]
     InvalidBindAddr {
         value: String,
@@ -273,6 +282,7 @@ pub struct McpRunServer {
     policy_engine: Arc<PolicyEngine>,
     default_cwd: PathBuf,
     backend: ExecutionBackend,
+    baffle: BaffleRuntimeConfig,
     tool_router: ToolRouter<Self>,
 }
 
@@ -283,10 +293,25 @@ impl McpRunServer {
         default_cwd: PathBuf,
         backend: ExecutionBackend,
     ) -> Self {
+        Self::new_with_baffle_config(
+            policy_engine,
+            default_cwd,
+            backend,
+            BaffleRuntimeConfig::from_env(),
+        )
+    }
+
+    fn new_with_baffle_config(
+        policy_engine: Arc<PolicyEngine>,
+        default_cwd: PathBuf,
+        backend: ExecutionBackend,
+        baffle: BaffleRuntimeConfig,
+    ) -> Self {
         Self {
             policy_engine,
             default_cwd,
             backend,
+            baffle,
             tool_router: Self::tool_router(),
         }
     }
@@ -299,10 +324,16 @@ impl McpRunServer {
         &self,
         Parameters(input): Parameters<RunCommandInput>,
     ) -> Result<Json<RunCommandOutput>, String> {
-        run_command_with_backend(&self.policy_engine, &self.default_cwd, self.backend, input)
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+        run_command_with_baffle_config(
+            &self.policy_engine,
+            &self.default_cwd,
+            self.backend,
+            self.baffle.clone(),
+            input,
+        )
+        .await
+        .map(Json)
+        .map_err(|error| error.to_string())
     }
 
     #[tool(
@@ -335,7 +366,7 @@ impl ServerHandler for McpRunServer {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some("Use run_command to execute allowlisted commands and check_command to inspect policy decisions. Requests use GANTRY_POLICY_DIR Rego policies and administrator-controlled filesystem profiles.".to_string()),
+            instructions: Some("Use run_command to execute allowlisted commands and check_command to inspect policy decisions. Requests use GANTRY_POLICY_DIR Rego policies and administrator-controlled filesystem profiles. Baffle sessions use trusted GANTRY_BAFFLE_* server settings.".to_string()),
             ..Default::default()
         }
     }
@@ -350,6 +381,20 @@ pub fn build_app_with_backend(
     default_cwd: PathBuf,
     backend: ExecutionBackend,
 ) -> Router {
+    build_app_with_baffle_config(
+        policy_engine,
+        default_cwd,
+        backend,
+        BaffleRuntimeConfig::from_env(),
+    )
+}
+
+pub(crate) fn build_app_with_baffle_config(
+    policy_engine: Arc<PolicyEngine>,
+    default_cwd: PathBuf,
+    backend: ExecutionBackend,
+    baffle: BaffleRuntimeConfig,
+) -> Router {
     let session_manager = Arc::new(LocalSessionManager::default());
     let policy_for_factory = policy_engine.clone();
     let cwd_for_factory = default_cwd.clone();
@@ -357,14 +402,16 @@ pub fn build_app_with_backend(
         policy_engine,
         default_cwd,
         backend,
+        baffle: baffle.clone(),
     };
 
     let mcp_service = StreamableHttpService::new(
         move || {
-            Ok(McpRunServer::new(
+            Ok(McpRunServer::new_with_baffle_config(
                 policy_for_factory.clone(),
                 cwd_for_factory.clone(),
                 backend,
+                baffle.clone(),
             ))
         },
         session_manager,
@@ -395,7 +442,12 @@ pub async fn serve(config: AppConfig) -> Result<(), AppError> {
         "starting gantry server",
     );
 
-    let app = build_app_with_backend(policy_engine, config.default_cwd.clone(), config.backend);
+    let app = build_app_with_baffle_config(
+        policy_engine,
+        config.default_cwd.clone(),
+        config.backend,
+        config.baffle.clone(),
+    );
     if let Some(bind_uds) = config.bind_uds.as_deref() {
         prepare_bind_uds_path(bind_uds)?;
         let listener = tokio::net::UnixListener::bind(bind_uds)?;
@@ -492,6 +544,7 @@ mod tests {
             bind_uds: None,
             policy_dir: None,
             backend: ExecutionBackend::Direct,
+            baffle: BaffleRuntimeConfig::from_lookup(|_| None),
             default_cwd: PathBuf::from("."),
         };
 
@@ -642,6 +695,9 @@ mod tests {
             "GANTRY_BIND_ADDR" => Some("0.0.0.0:3000".to_string()),
             "GANTRY_POLICY_DIR" => Some("/env/policies".to_string()),
             "GANTRY_BACKEND" => Some("bubblewrap".to_string()),
+            "GANTRY_BAFFLE_CONTROL_SOCKET" => Some("/var/run/baffle/control.sock".to_string()),
+            "GANTRY_BAFFLE_SESSION_SOCKET_DIR" => Some("/var/run/baffle/proxies".to_string()),
+            "GANTRY_BAFFLE_CA_CERT" => Some("/var/lib/baffle/ca.pem".to_string()),
             _ => None,
         })
         .expect("valid GANTRY server environment");
@@ -651,6 +707,18 @@ mod tests {
         );
         assert_eq!(config.policy_dir, Some(PathBuf::from("/env/policies")));
         assert_eq!(config.backend, ExecutionBackend::Bubblewrap);
+        assert_eq!(
+            config.baffle.control_socket,
+            PathBuf::from("/var/run/baffle/control.sock")
+        );
+        assert_eq!(
+            config.baffle.session_socket_dir,
+            PathBuf::from("/var/run/baffle/proxies")
+        );
+        assert_eq!(
+            config.baffle.ca_certificate,
+            Some(PathBuf::from("/var/lib/baffle/ca.pem"))
+        );
     }
 
     #[tokio::test]
@@ -664,6 +732,7 @@ mod tests {
             bind_uds: Some(socket_path.clone()),
             policy_dir: None,
             backend: ExecutionBackend::Direct,
+            baffle: BaffleRuntimeConfig::from_lookup(|_| None),
             default_cwd: std::env::current_dir().expect("current dir"),
         };
 
