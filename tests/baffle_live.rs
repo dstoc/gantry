@@ -30,6 +30,7 @@ struct BaffleDaemon {
     control_socket: PathBuf,
     session_socket_dir: PathBuf,
     ca_certificate: PathBuf,
+    daemon_log: PathBuf,
 }
 
 impl Drop for BaffleDaemon {
@@ -67,7 +68,7 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
         return;
     }
 
-    let directory = tempfile::tempdir_in("/tmp").expect("temporary fixture directory");
+    let directory = tempfile::tempdir_in("/dev/shm").expect("temporary fixture directory");
     let origin = start_https_origin(directory.path()).await;
     let upstream_ca = directory.path().join("upstream-ca.pem");
     let daemon = start_baffle_daemon(&binary, directory.path(), &upstream_ca);
@@ -89,8 +90,12 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
         curl.is_file(),
         "curl is required for the controlled HTTPS test"
     );
-    let policy_a = Arc::new(policy_engine(directory.path(), curl, Some("path-a.toml")));
-    let policy_b = Arc::new(policy_engine(directory.path(), curl, Some("path-b.toml")));
+    // Each engine watches its policy directory for changes. Keep fixture
+    // generations separate so loading one decision cannot reload another.
+    let policy_a_root = directory.path().join("policy-a");
+    let policy_b_root = directory.path().join("policy-b");
+    let policy_a = Arc::new(policy_engine(&policy_a_root, curl, Some("path-a.toml")));
+    let policy_b = Arc::new(policy_engine(&policy_b_root, curl, Some("path-b.toml")));
     let cwd = PathBuf::from("/");
     let port = origin.port;
 
@@ -135,9 +140,22 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
     let result_b = result_b
         .expect("second request task")
         .expect("second command");
-    assert_eq!(result_a.exit_code, Some(0), "{}", result_a.stderr);
+    let diagnostics = format!(
+        "Baffle daemon log:\n{}",
+        fs::read_to_string(&daemon.daemon_log).unwrap_or_else(|error| error.to_string())
+    );
+    assert!(
+        result_a.exit_code == Some(0) && result_b.exit_code == Some(0),
+        "concurrent HTTPS requests failed\nA: exit={:?}; stderr:\n{}\nstdout:\n{}\nB: exit={:?}; stderr:\n{}\nstdout:\n{}\n{}",
+        result_a.exit_code,
+        result_a.stderr,
+        result_a.stdout,
+        result_b.exit_code,
+        result_b.stderr,
+        result_b.stdout,
+        diagnostics,
+    );
     assert_eq!(result_a.stdout, "served /a\n");
-    assert_eq!(result_b.exit_code, Some(0), "{}", result_b.stderr);
     assert_eq!(result_b.stdout, "served /b\n");
     wait_for_sessions(&client, 0).await;
 
@@ -179,7 +197,11 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
         .expect("create another active session for the visibility check");
     let other_socket = other_lease.socket_path().to_path_buf();
     let shell = Path::new("/usr/bin/dash");
-    let visibility_policy = policy_engine(directory.path(), shell, Some("path-a.toml"));
+    let visibility_policy = policy_engine(
+        &directory.path().join("visibility-policy"),
+        shell,
+        Some("path-a.toml"),
+    );
     let visibility_script = concat!(
         "test -S /run/gantry/proxy.sock || exit 41; ",
         "test -f /run/gantry/baffle-ca.pem || exit 42; ",
@@ -219,7 +241,11 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
     wait_for_sessions(&client, 0).await;
 
     // A no-session execution has neither bridge nor Baffle CA access.
-    let no_session_shell_policy = policy_engine(directory.path(), shell, None);
+    let no_session_shell_policy = policy_engine(
+        &directory.path().join("no-session-shell-policy"),
+        shell,
+        None,
+    );
     let no_session_visibility = run_command_with_baffle_config(
         &no_session_shell_policy,
         &cwd,
@@ -244,7 +270,8 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
         no_session_visibility.stderr
     );
 
-    let no_session_curl_policy = policy_engine(directory.path(), curl, None);
+    let no_session_curl_policy =
+        policy_engine(&directory.path().join("no-session-curl-policy"), curl, None);
     let no_session = run_command_with_baffle_config(
         &no_session_curl_policy,
         &cwd,
@@ -332,7 +359,7 @@ async fn bubblewrap_mounts_a_mock_file_only_baffle_uds_and_releases_its_lease() 
     if !Path::new("/usr/bin/bwrap").is_file() && !Path::new("/bin/bwrap").is_file() {
         panic!("Bubblewrap is required for the mock Baffle UDS mount test");
     }
-    let directory = tempfile::tempdir_in("/tmp").expect("mock fixture directory");
+    let directory = tempfile::tempdir_in("/dev/shm").expect("mock fixture directory");
     run_mock_uds_mount(directory.path()).await;
 }
 
@@ -478,6 +505,7 @@ fn curl_input_for_host(
         executable: "/usr/bin/curl".into(),
         args: vec![
             "--fail".into(),
+            "--verbose".into(),
             "--silent".into(),
             "--show-error".into(),
             "--connect-timeout".into(),
@@ -560,7 +588,8 @@ fn start_baffle_daemon(binary: &Path, root: &Path, upstream_ca: &Path) -> Baffle
     let ca_certificate = baffle_root.join("ca.pem");
     let ca_private_key = baffle_root.join("ca-key.pem");
     let config_path = baffle_root.join("daemon.toml");
-    let daemon_log = fs::File::create(baffle_root.join("daemon.log")).expect("daemon log");
+    let daemon_log_path = baffle_root.join("daemon.log");
+    let daemon_log = fs::File::create(&daemon_log_path).expect("daemon log");
     let uid = fs::metadata(&baffle_root)
         .expect("Baffle root metadata")
         .uid();
@@ -605,6 +634,7 @@ fn start_baffle_daemon(binary: &Path, root: &Path, upstream_ca: &Path) -> Baffle
         control_socket,
         session_socket_dir: socket_dir,
         ca_certificate,
+        daemon_log: daemon_log_path,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
