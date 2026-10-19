@@ -9,12 +9,12 @@
 
 Evolve Gantry from a policy-enforced command runner into a **policy-driven execution system offering both sandboxed and direct command execution**. Rego authorizes the requested command and selects:
 
-- A named **filesystem profile** containing administrator-defined mounts, or `null` to select Direct execution.
+- A **filesystem profile** (a named profile or `null`) describing filesystem requirements independently of the selected backend.
 - An optional **Baffle session configuration filename**, which controls network access.
 
-Gantry selects the execution backend from `filesystem`: **a named profile selects Bubblewrap (`bwrap`)** and **`null` selects Direct** (subject to a trusted configuration gate). Bubblewrap enforces per-command filesystem and network isolation, and optionally uses a fresh Baffle session through a Rust `gantry-supervisor` TCP-to-UDS bridge. Direct retains Gantry's current `tokio::process::Command` execution path, without Bubblewrap or the supervisor. Both run the authorized absolute executable path without another policy check.
+The **operator selects the backend at startup** using `--backend bubblewrap` (the default) or `--backend direct`. Rego supplies filesystem and Baffle requirements; Gantry rejects decisions the selected backend cannot support. Bubblewrap requires a named filesystem profile, isolates each command, and optionally provisions Baffle through `gantry-supervisor`. Direct requires both policy fields to be `null` and retains Gantry's current `tokio::process::Command` execution path without Bubblewrap or a supervisor.
 
-Every Bubblewrap execution receives an isolated filesystem and network namespace. Direct deliberately retains Gantry's existing process/filesystem/network access; it must be explicitly enabled and is **never** an automatic fallback after Bubblewrap failure. Authorization remains mandatory for both backends. Existing MCP, raw streaming and check interfaces remain the entry points.
+Every Bubblewrap execution receives an isolated filesystem and network namespace. Direct retains Gantry's existing process/filesystem/network access and requires the explicit `--backend direct` flag; it is **never** a fallback after Bubblewrap failure. Authorization remains mandatory for both backends. Existing MCP, raw streaming and check interfaces remain the entry points.
 
 ## Motivation and existing behaviour
 
@@ -27,13 +27,13 @@ Sandboxed invocations receive their own filesystem view and network namespace, w
 ## Goals
 
 1. Extend Rego to return a single structured decision containing `allow`, `filesystem`, and `baffle_session`.
-2. Select either a **named, administrator-controlled filesystem profile** or `null` for Direct; select an optional Baffle configuration filename only for Bubblewrap.
+2. Select a named filesystem profile or `null`, and optionally a Baffle configuration filename, without choosing the backend through Rego. The backend is selected by the startup CLI flag.
 3. Implement **Bubblewrap and Direct** execution backends with a common execution lifecycle; Baffle is the only managed network integration.
 4. Create an isolated filesystem, process environment and network namespace for every Bubblewrap command, while retaining the existing execution model for Direct.
 5. Give each network-authorized command a unique ephemeral Baffle session and only that session's data socket.
 6. Implement a local HTTP-proxy-compatible TCP-to-UDS bridge in Rust, without `socat` or another long-running external bridge service.
 7. Preserve current no-shell command semantics, trusted CWD input to Rego, authorized command forwarding, streamed output, exit reporting, and cancellation.
-8. Fail closed when authorization or selected-backend preparation fails, and never fall back from a failed Bubblewrap execution to Direct.
+8. Reject Rego decisions incompatible with the startup-selected backend, fail closed on backend preparation errors, and never fall back from Bubblewrap to Direct.
 9. Keep future OCI/microVM backends possible without changing Rego policy names or semantics.
 
 ## Non-goals
@@ -41,7 +41,7 @@ Sandboxed invocations receive their own filesystem view and network namespace, w
 - Changes to Cladding, its container topology, or its mount configuration.
 - Changes to the Baffle daemon, v2 control protocol, or session policy syntax.
 - Implementing other execution backends beyond Bubblewrap and Direct.
-- Arbitrary mounts, backend selection, or Baffle session creation requested by an untrusted command caller.
+- Arbitrary mounts, backend selection through Rego or individual command requests, or Baffle session creation requested by an untrusted caller.
 - Network providers other than Baffle, general network-provider APIs, and separate network-profile mappings.
 - Adding unrestricted direct network access to **Bubblewrap**, shell interpolation, or a generic network-forwarding service. Direct intentionally inherits the ambient networking of the Gantry process.
 - A complete resource quota framework; memory, CPU, and PID limits can be designed separately.
@@ -57,16 +57,16 @@ Trusted resolution + Rego authorization
          |
          v
 Execution planner
-  - Route based on filesystem decision
-  - Validate backend compatibility
+  - Use startup-selected backend (default: bubblewrap)
+  - Validate policy requirements against backend
   - Carry forward authorized path, args, env and CWD
          |
-         +-- filesystem: null ----------> Direct (if enabled)
+         +-- --backend direct -----------> Direct (explicit CLI flag)
          |                                - Existing Command::new(path)
          |                                - Gantry's ambient filesystem/network
          |                                - No bwrap, supervisor, or Baffle lease
          |
-         +-- filesystem: "profile" -----> Bubblewrap
+         +-- --backend bubblewrap -------> Bubblewrap (default)
                                           - Apply selected profile mounts
                                           - Isolate PID/mount/network namespaces
                                           - Optional leased Baffle session
@@ -77,7 +77,7 @@ Command exit -> output/status and backend-specific cleanup
 
 ```
 
-**Boundary:** Rego explicitly selects `filesystem: null` for Direct or a named profile for Bubblewrap. Gantry validates the backend combination, including Baffle selection. Bubblewrap enforces the chosen filesystem/network isolation; Direct receives Gantry's existing ambient authority by design. The caller cannot choose or override a backend, and Bubblewrap failures must not downgrade to Direct.
+**Boundary:** The startup CLI flag selects the backend independently of Rego. Rego specifies required filesystem and Baffle access; Gantry checks compatibility before execution. Direct requires both fields to be `null`, while Bubblewrap requires a named filesystem profile. Command callers and policies cannot change the configured backend, and Bubblewrap failures never downgrade to Direct.
 
 ## 1. Rego decision contract
 
