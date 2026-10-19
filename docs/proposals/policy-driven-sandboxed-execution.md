@@ -443,57 +443,77 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 
 Include negative tests that deliberately attempt to connect to the parent proxy listener, open other Baffle session sockets, access protected filesystem paths, and use direct TCP egress.
 
-## 9. Phased implementation plan
+## 9. Concrete implementation plan
 
-### Phase 0 — Feasibility spikes
+### Phase 0 — Feasibility complete; proceed to implementation
 
-- Demonstrate Bubblewrap nested mount/user/PID/network namespace creation in the intended runtime environment.
-- Validate private loopback availability and a local TCP listener.
-- Bind only a live Baffle pathname UDS into the child namespace and successfully proxy HTTPS CONNECT through it.
-- Prove unwanted parent socket/network access is blocked.
-- Test process-tree cleanup and lease loss when the parent dies.
-- Demonstrate that the supervisor receives and runs the already-resolved absolute executable path with the authorized invocation, and that a missing or inaccessible authorized CWD causes a spawn error.
+Manual smoke tests **passed in the intended Bubblewrap/Podman environment**:
 
-**Deliverable:** documented compatibility findings and any required kernel/container prerequisites. If critical assumptions fail, adjust the enforcement design before implementing the full backend.
+| Test | Observed result |
+| --- | --- |
+| Nested Bubblewrap user, mount, PID and network namespaces | Sandbox started |
+| Local TCP listener/client on `127.0.0.1` | Passed |
+| Direct external TCP from isolated namespace | Blocked |
+| TCP-to-UDS bridge through a bind-mounted **mock** live Unix socket using `socat` | Passed |
+| Terminating a Bubblewrap launcher with a child process | No matching orphan observed |
+| Launch absolute executable with an intended CWD; reject absent CWD | Both passed |
 
-### Phase 1 — Structured policy and profiles
+These are **feasibility smoke tests**, not proof of full isolation or lifecycle correctness. They used a temporary broad read-only root mount; they did not prove other Baffle sockets are hidden, exercise an actual Baffle HTTPS CONNECT, or test Baffle lease release. **Do not hold Phase 1 on further standalone spikes.** Perform those checks as ordinary Phase 3–4 implementation/integration tests; they remain release acceptance requirements.
 
-- Implement the structured Rego result and migration from boolean `allow`.
-- Define direct-path filesystem profile schema, Baffle configuration filename validation, and policy reload consistency.
-- Build a validated `ExecutionPlan` with the already-authorized executable path, arguments, effective environment and CWD path.
-- Extend `/check` and tests without side effects.
+### Phase 1 — CLI, structured authorization, and planning
 
-**Deliverable:** a policy-only dry run showing selected source paths and Baffle configuration file.
+**Code locations:** `src/main.rs`, `src/mcp.rs` (move config parsing into `src/config.rs` if useful), `src/policy.rs`, `src/executor.rs`, plus new `src/filesystem.rs` and `src/execution.rs`.
 
-### Phase 2 — Direct and Bubblewrap execution backends
+1. **Server arguments/config:** Implement `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend` with `clap` or an equivalently tested parser. Default backend is Bubblewrap. Read only `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`; remove legacy environment lookups and update errors, README, and MCP instructions. Apply the CLI-over-environment listener precedence specified above, and reject invalid/dual bind flags.
+2. **Structured Rego result:** Replace `data.sandbox.main.allow` with `data.sandbox.main.decision` in `src/policy.rs`. Deserialize to a typed `PolicyDecision { allow, filesystem, baffle_session }`. For `allow: true`, require both profile fields to be **present** (an explicit `null` differs from a missing field); reject wrong types, conflicting/undefined results and invalid names. Preserve the existing command path, SHA-256, args, forwarded-env and trusted-CWD input. Retain deny-all on failed policy load/reload.
+3. **Profile loader:** Read administrator-controlled `filesystems/*.toml` into a typed mount profile model using the schema in §2. Validate required fields, duplicate/overlapping destinations, RO/RW access, tmpfs sizes, protected destinations, and absolute source/target paths. Profiles contain direct paths; do not introduce a named-resource registry. Resolve the selected profile only when required by Bubblewrap.
+4. **Consistent reload generation:** Publish the compiled Rego policy and validated filesystem profiles together as one immutable generation. On reload, construct and validate the whole generation before swapping it; if compilation/validation fails, use the existing deny-all behavior. An execution retains the generation used for its authorization and profile resolution. Baffle filenames remain references to daemon-managed files, not contents loaded into Gantry.
+5. **Authorized plan:** Split `authorize_command_request` in `src/executor.rs` into reusable authorization and execution steps. Build a typed `AuthorizedInvocation` with the already-resolved absolute executable path, exact args, effective env, authorized CWD path and policy generation; attach a validated profile and optional Baffle filename for Bubblewrap. The backend is **fixed by startup config**, not by Rego. Validate compatibility: Direct requires both fields `null`, Bubblewrap requires a named filesystem profile.
+6. **Side-effect-free checks:** Extend `RunCommandCheckOutput` and `check_command` to report `filesystem`, `baffle_session`, and the configured `backend`, including a useful denial reason for incompatible combinations. `/check` must not start subprocesses, mount anything or create Baffle leases. Preserve the existing public command request schema.
 
-- Introduce `ExecutionBackend` and `RunningExecution` lifecycle types.
-- Implement Direct by retaining Gantry's current process spawn and lifecycle; select it only with `--backend direct`, with `bubblewrap` as the default.
-- Add `--bind-addr`, `--bind-uds`, and `--policy-dir` with the documented `GANTRY_` environment fallbacks and validation; remove recognition of old server variable names.
-- Implement isolated per-command Bubblewrap execution without external networking.
-- Implement simple authorized-invocation handoff to the supervisor without a new executable lookup; use the authorized CWD path and preserve output and cancellation semantics.
-- Add filesystem and namespace escape tests.
+**Tests:** CLI/environment precedence, bind target conflicts, old variables ignored, default backend, Rego result shapes and conflict handling, profile parsing and invalid mounts, backend compatibility matrix, reload atomicity and deny-all, and `/check` with no side effects.
 
-**Deliverable:** authorized Bubblewrap commands run in isolated no-network filesystem environments, while explicitly configured Direct runs preserve existing Gantry execution.
+**Phase gate:** All combinations of Rego profiles and the configured backend can be checked and resolved into a validated plan, without launching a sandbox. When splitting work into separate PRs, do not switch the runtime default to Bubblewrap until Phase 2 actually implements it.
 
-### Phase 3 — Per-command Baffle integration
+### Phase 2 — Direct backend and isolated Bubblewrap execution
 
-- Integrate Baffle's existing client directly and implement ephemeral lease ownership.
-- Implement `gantry-supervisor` with integrated Tokio TCP-to-UDS forwarding.
-- Expose only the selected data UDS to the command sandbox.
-- Set controlled proxy environment and public CA trust as required.
-- Enforce readiness and cleanup on all success/failure paths.
+**Code locations:** new `src/backend/{mod.rs,direct.rs,bubblewrap.rs}`, `src/execution.rs`, `src/bin/gantry-supervisor.rs`, and integration points in `src/mcp.rs`, `src/raw.rs`, `src/executor.rs`.
 
-**Deliverable:** independent commands can use different Baffle policies concurrently, without `socat`.
+1. **Shared execution API:** Introduce `ExecutionBackend::start(plan) -> RunningExecution` (or equivalent) with stdout/stderr handles, exit/wait and explicit cancellation/cleanup. Ensure `run_command_impl` (buffered MCP) and `raw_handler` (NDJSON streaming) use the **same** authorization and backend start path. Refactor `src/raw.rs` away from assuming every running command is directly a `tokio::process::Child`. Preserve stdout/stderr order per stream, output truncation, `start`/`exit` events, nonzero exit status and client-disconnect behavior.
+2. **Direct first:** Extract the existing `spawn_command_process` logic into `DirectBackend`: `Command::new(resolved_path)`, approved args, existing env assembly and trusted CWD handling, inherited network/filesystem view. No supervisor, Baffle provisioning or mounts. Only start it when the server was explicitly launched with `--backend direct` **and** Rego returns both profiles `null`; never use it as a fallback.
+3. **Bubblewrap launcher:** Start a fresh Bubblewrap process for each invocation, with isolated user/mount/PID/network namespaces, private `/proc`, `/tmp` and `/run`, no external network routes, and `--die-with-parent`/session isolation. Construct a restricted runtime baseline that includes the executable path, its interpreter/dynamic linker and required system libraries plus the selected profile's validated mounts. Do **not** use the whole-root `--ro-bind / /` from the Phase 0 smoke tests in production. Do not expose the Gantry/Baffle control sockets or unrelated host paths. Reject missing executable, CWD or runtime dependencies rather than widening the mount view.
+4. **Supervisor handoff:** Build and install a small Rust `gantry-supervisor` binary alongside Gantry, and mount it as trusted runtime content. Pass `AuthorizedInvocation` over a trusted private pipe or equivalent non-caller-controlled channel; never invoke a shell or repeat `PATH` lookup/Rego evaluation. The supervisor launches the resolved absolute executable with the authorized args, CWD and effective env. No sealed executable snapshot, CWD descriptor transfer or TOCTOU hardening beyond the agreed threat model.
+5. **Startup and teardown:** Use an explicit supervisor status/readiness signal so `/raw` sends `start` only after the authorized child actually starts. Distinguish preparation/spawn failures from child nonzero exits. Keep supervision/namespace ownership until descendants have terminated. Ensure cancellation, disconnect, Gantry shutdown and launcher death clean up all descendant processes. With `baffle_session: null`, the supervisor must **not** open a proxy listener.
+6. **Activate the default:** Once Bubblewrap executes correctly, make it the default server backend; on unsupported platforms or namespace-denied containers, report a clear startup/execution error and **do not switch to Direct**. Explicit Direct remains available where appropriate.
 
-### Phase 4 — Hardening and documentation
+**Tests:** Direct backward-compatible execution, all backend-policy rejection cases, sandbox read-only/write/tmpfs behavior, hidden paths/control sockets, direct egress denied, ELF/shebang and CWD handling, stdout/stderr streaming, exit status, errors before `start`, cancellation and descendant cleanup. Run Bubblewrap tests in the target Podman environment, not only on the host.
 
-- Complete real-Baffle end-to-end tests and negative isolation tests.
-- Add useful diagnostics for policy selection, backend startup, Baffle session provisioning and cleanup, without leaking secrets or raw sensitive arguments unnecessarily.
-- Document profile authoring, runtime prerequisites and unsupported environments.
-- Confirm no implicit direct-execution fallback.
+**Phase gate:** Both backends work through `/mcp`, `/raw`, and `/check`; Bubblewrap executes real commands with profile-enforced filesystem access and **no external network** without Baffle. No Baffle dependency is required for this gate.
 
-**Deliverable:** documented security guarantees and a production-ready initial backend.
+### Phase 3 — Per-command Baffle sessions and in-process bridge
+
+**Code locations:** new `src/baffle.rs` (trusted session owner), Bubblewrap backend, and `src/bin/gantry-supervisor.rs`.
+
+1. **Acquire lease in trusted Gantry:** Add the `baffle-client` dependency. Use `Client::new(control_socket).create_from_file(authorized_filename).await` against the daemon's existing **file-only** mode. The filename is the Rego-selected relative Baffle config filename, validated to the daemon's accepted path grammar. Gantry never reads credentials or creates inline policy. Keep the returned `Session` handle outside the sandbox until all descendants finish; dropping/closing it releases the ephemeral lease.
+2. **Expose only the data socket:** For a network-authorized Bubblewrap invocation, bind-mount the resulting live `Session::socket_path()` at a fixed location such as `/run/gantry/proxy.sock` in a private `/run`. Do not expose the containing Baffle directory, another session socket, or the Baffle control UDS. Reject mount/permission failures without changing networking or selecting Direct.
+3. **Bridge inside supervisor:** Use Tokio TCP listener on `127.0.0.1:3128` and a Unix-socket connection to the assigned data socket for each accepted client; use bidirectional byte copying. There is no `socat` dependency in production. Check bridge readiness before spawning the authorized child.
+4. **Proxy environment/trust:** Only for an authorized Baffle session, set controlled `http_proxy`, `https_proxy`, `HTTP_PROXY`, and `HTTPS_PROXY` pointing to the local bridge; prevent user-supplied bypass variables from overriding this routing. Mount the public Baffle CA where required, never its signing key or credential files. Preserve the command's existing no-shell semantics.
+5. **Lease and failure ordering:** Validate command/policy/profile/backend before creating a session; provision the lease, assemble mounts, confirm bridge/child startup, then stream. Clean up child processes and bridge **before releasing** the Baffle lease on normal completion, startup error, timeout/cancellation, disconnect or parent shutdown. Two concurrent invocations must use distinct sockets/leases.
+6. **Direct stays unchanged:** A non-null Baffle filename under `--backend direct` is a validation error; `baffle_session: null` under Direct retains Gantry's ambient networking.
+
+**Tests (performed during implementation, not as more Phase 0 spikes):** Real HTTPS CONNECT through Baffle with permitted and denied destinations/paths; mock and live UDS mount behavior; prove other session/control sockets are absent from the restricted sandbox; run concurrent differently authorized sessions; confirm lease release on success and failure. Use a local controlled HTTPS target or deterministic test fixture where possible rather than relying solely on external services.
+
+**Phase gate:** Commands with selected Baffle profiles can make policy-compliant HTTPS requests, cannot bypass the proxy or access another session, and leave no orphaned Baffle sessions.
+
+### Phase 4 — End-to-end hardening, migration, and release
+
+1. **System tests:** Exercise `/mcp`, `/raw`, `/check`, `run-remote --check`, both listener transports and both backends end-to-end. Verify deny-all on bad policy reload, malformed/unknown profile values, mount errors, unsupported platforms, failed Baffle creation, bridge failure, child errors, client disconnect, parent termination and concurrent execution.
+2. **Isolation tests:** Move the Phase 0 experiments into repeatable integration tests using the *restricted* runtime root. Assert RO/RW semantics, protection of non-mounted paths, no external networking without Baffle, no parent/local proxy or other Baffle socket access, and descendant/process-group cleanup. Include the deferred real-Baffle and session-release checks in automated integration coverage.
+3. **Diagnostics:** Report backend, selected profile, Baffle filename/session identity where safe, namespace setup versus child exit failure, and cleanup outcomes. Never log injected secrets or credential-bearing request content.
+4. **Migration:** Update README, CLI help, filesystem-profile and Rego examples, deployment documentation and environment variable names. Remove legacy `MCP_BIND_ADDR`, `MCP_BIND_UDS` and `POLICY_DIR` server configuration. Document explicit `--backend direct` plus null profiles for existing deployments, and Bubblewrap's new default/host prerequisites. Preserve the current `run-remote` client syntax and environment variables.
+5. **Final verification:** Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the new Podman/Bubblewrap/Baffle integration suite. CI on platforms lacking Bubblewrap must not silently select Direct; use explicit Direct for compatibility-only tests and target Linux integration CI for the sandbox guarantees.
+
+**Release gate:** Every final acceptance criterion below is covered by an automated test or an explicit, reproducible integration-test procedure. Passing the Phase 0 smoke tests alone is not sufficient for release.
 
 ## 10. Open decisions
 
