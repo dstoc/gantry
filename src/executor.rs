@@ -1644,22 +1644,80 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             "read-write profile rejected a write"
         );
 
+        // Model the Gantry-side HTTP proxy on the host loopback. The command
+        // below must reach this proxy from the host, then fail from the
+        // Bubblewrap network namespace without the listener seeing a second
+        // connection.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("host loopback listener");
+            .expect("host parent-proxy listener");
         let port = listener.local_addr().expect("listener address").port();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("proxy connection");
+                accepted_tx.send(()).expect("proxy acceptance receiver");
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).await.expect("read proxy request");
+                assert!(
+                    request[..count].starts_with(b"GET http://proxy-oracle.invalid/probe "),
+                    "unexpected HTTP proxy request: {}",
+                    String::from_utf8_lossy(&request[..count])
+                );
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nproxy-ok",
+                )
+                .await
+                .expect("write proxy response");
+            }
+        });
         let curl = find_executable("curl").expect("curl executable");
+        let proxy_args = vec![
+            "--silent".to_string(),
+            "--show-error".to_string(),
+            "--connect-timeout".to_string(),
+            "1".to_string(),
+            "--max-time".to_string(),
+            "2".to_string(),
+            "--proxy".to_string(),
+            format!("http://127.0.0.1:{port}"),
+            "--noproxy".to_string(),
+            String::new(),
+            "http://proxy-oracle.invalid/probe".to_string(),
+        ];
+        let host_curl = curl.clone();
+        let host_proxy_args = proxy_args.clone();
+        let host_result = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(host_curl)
+                .args(host_proxy_args)
+                .env_clear()
+                .output()
+        })
+        .await
+        .expect("host curl task joins")
+        .expect("host curl request starts");
+        assert!(
+            host_result.status.success(),
+            "host curl could not reach its parent proxy: {}",
+            String::from_utf8_lossy(&host_result.stderr)
+        );
+        assert_eq!(
+            host_result.stdout, b"proxy-ok",
+            "host proxy did not return its response"
+        );
+        assert!(
+            accepted_rx.try_recv().is_ok(),
+            "host proxy did not accept the unsandboxed control request"
+        );
+
         let output = run_command_with_backend(
             &writable_engine,
             &cwd,
             ExecutionBackend::Bubblewrap,
             RunCommandInput {
                 executable: curl,
-                args: vec![
-                    "--max-time".to_string(),
-                    "2".to_string(),
-                    format!("http://127.0.0.1:{port}/"),
-                ],
+                args: proxy_args,
                 cwd: Some("/".to_string()),
                 env: None,
             },
@@ -1669,9 +1727,18 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         assert_ne!(
             output.exit_code,
             Some(0),
-            "sandbox reached the host loopback listener"
+            "sandbox reached the host parent proxy: stdout={}, stderr={}",
+            output.stdout,
+            output.stderr
         );
-        drop(listener);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), accepted_rx.recv())
+                .await
+                .is_err(),
+            "host parent proxy accepted a connection from the sandbox"
+        );
+        proxy_task.abort();
+        let _ = proxy_task.await;
 
         let cat = find_executable("cat").expect("cat executable");
         let output = run_command_with_backend(
