@@ -55,3 +55,14 @@ pub(crate) fn host_has_required_bubblewrap() -> bool {
         .output()
         .is_ok_and(|output| output.status.success())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn required_bubblewrap_test_environment_is_available() {
+    if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_some() {
+        assert!(
+            host_has_required_bubblewrap(),
+            "Bubblewrap integration tests were required, but the configured namespaces are unavailable"
+        );
+    }
+}

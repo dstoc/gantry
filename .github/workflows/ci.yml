@@ -14,3 +14,19 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      - name: Test in Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+          sudo podman run --rm \
+            --cap-add=SYS_ADMIN \
+            --security-opt=seccomp=unconfined \
+            --security-opt=apparmor=unconfined \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            docker.io/library/rust:1-bookworm \
+            sh -euc '
+              apt-get update
+              apt-get install --yes bubblewrap curl
+              GANTRY_REQUIRE_BUBBLEWRAP_TESTS=1 cargo test --locked
+            '
