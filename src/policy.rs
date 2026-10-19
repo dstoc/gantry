@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use regorus::Engine as RegoEngine;
 use serde::Deserialize;
@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::filesystem::{
-    FilesystemProfile, load_profiles, validate_baffle_filename, validate_profile_name,
+    FilesystemProfile, load_profiles_from_sources, profile_files, validate_baffle_filename,
+    validate_profile_name,
 };
 
 const REGO_DECISION_QUERY: &str = "data.sandbox.main.decision";
@@ -141,7 +142,14 @@ struct PolicyFileFingerprint {
 #[derive(Debug)]
 pub struct PolicyEngine {
     state: RwLock<Arc<PolicyGeneration>>,
+    reload_lock: Mutex<()>,
     sources: PolicySources,
+}
+
+#[derive(Debug)]
+struct CapturedPolicyFile {
+    path: PathBuf,
+    contents: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -200,6 +208,7 @@ impl PolicyEngine {
 
         Self {
             state: RwLock::new(snapshot),
+            reload_lock: Mutex::new(()),
             sources,
         }
     }
@@ -213,6 +222,7 @@ impl PolicyEngine {
                 BTreeMap::new(),
                 None,
             ))),
+            reload_lock: Mutex::new(()),
             sources: PolicySources {
                 policy_dir: None,
                 filesystem_dir: None,
@@ -325,6 +335,14 @@ impl PolicyEngine {
     }
 
     pub fn reload(&self) {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .expect("policy reload lock poisoned");
+        self.reload_locked();
+    }
+
+    fn reload_locked(&self) {
         match load_policy_snapshot(&self.sources) {
             Ok(snapshot) => {
                 if let Some(rego) = &snapshot.rego {
@@ -356,52 +374,73 @@ impl PolicyEngine {
             return;
         }
 
-        let current = match fingerprint_sources(&self.sources) {
-            Ok(fingerprint) => fingerprint,
+        let current = fingerprint_sources(&self.sources);
+        let previous = self.current_fingerprint();
+        if current
+            .as_ref()
+            .is_ok_and(|current| previous.as_ref() == Some(current))
+        {
+            return;
+        }
+
+        let _reload = self
+            .reload_lock
+            .lock()
+            .expect("policy reload lock poisoned");
+        let current = fingerprint_sources(&self.sources);
+        let previous = self.current_fingerprint();
+        match current {
+            Ok(current) if previous.as_ref() == Some(&current) => {}
+            Ok(_) => self.reload_locked(),
             Err(error) => {
                 tracing::error!(error = %error, "policy fingerprint failed; deny-all activated");
                 *self
                     .state
                     .write()
                     .expect("policy state write lock poisoned") =
-                    Arc::new(PolicyGeneration::deny_all(error.to_string()));
-                return;
+                    Arc::new(PolicyGeneration::deny_all(error));
             }
-        };
+        }
+    }
 
-        let previous = self
-            .state
+    fn current_fingerprint(&self) -> Option<PolicyFingerprint> {
+        self.state
             .read()
             .expect("policy state read lock poisoned")
             .fingerprint
-            .clone();
-
-        if previous.as_ref() == Some(&current) {
-            return;
-        }
-
-        self.reload();
+            .clone()
     }
 }
 
 fn load_policy_snapshot(sources: &PolicySources) -> Result<Arc<PolicyGeneration>, String> {
-    let policy_dir = sources
-        .policy_dir
-        .as_ref()
-        .ok_or_else(|| "GANTRY_POLICY_DIR is not configured".to_string())?;
+    let captured = capture_policy_files(sources)?;
+    let fingerprint = fingerprint_captured_files(&captured);
 
-    let rego = load_rego_policy_dir(policy_dir)
+    let rego_files: Vec<_> = captured
+        .iter()
+        .filter(|file| file.path.extension().and_then(|ext| ext.to_str()) == Some("rego"))
+        .collect();
+    let rego = load_rego_files(&rego_files)
         .map_err(|error| format!("rego policy load failed: {error}"))?;
-    let filesystem_profiles = if let Some(directory) = &sources.filesystem_dir {
-        load_profiles(directory)
-            .map_err(|error| format!("filesystem profile load failed: {error}"))?
-            .into_iter()
-            .map(|(name, profile)| (name, Arc::new(profile)))
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-    let fingerprint = fingerprint_sources(sources)?;
+
+    let profile_files: Vec<_> = captured
+        .iter()
+        .filter(|file| file.path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .map(|file| (file.path.clone(), file.contents.clone()))
+        .collect();
+    let filesystem_profiles = load_profiles_from_sources(&profile_files)
+        .map_err(|error| format!("filesystem profile load failed: {error}"))?
+        .into_iter()
+        .map(|(name, profile)| (name, Arc::new(profile)))
+        .collect();
+
+    // The compiler and profile parser consume one captured byte set. A second capture
+    // prevents publishing it if any source was added, removed, or changed during loading.
+    let current = capture_policy_files(sources)?;
+    if fingerprint_captured_files(&current) != fingerprint {
+        return Err("policy sources changed while loading; deny-all activated".to_string());
+    }
+
     Ok(Arc::new(PolicyGeneration::from_rego(
         rego,
         filesystem_profiles,
@@ -424,7 +463,32 @@ fn load_rego_modules(modules: &[(&str, &str)]) -> Result<RegoPolicy, String> {
     })
 }
 
-fn load_rego_policy_dir(policy_dir: &Path) -> Result<RegoPolicy, String> {
+fn load_rego_files(files: &[&CapturedPolicyFile]) -> Result<RegoPolicy, String> {
+    if files.is_empty() {
+        return Err("no .rego files found under policy directory".to_string());
+    }
+
+    let mut engine = RegoEngine::new();
+    for file in files {
+        let source = std::str::from_utf8(&file.contents)
+            .map_err(|error| format!("failed decoding '{}': {error}", file.path.display()))?;
+
+        engine
+            .add_policy(file.path.to_string_lossy().into_owned(), source.to_string())
+            .map_err(|error| format!("failed compiling '{}': {error}", file.path.display()))?;
+    }
+
+    Ok(RegoPolicy {
+        engine,
+        module_count: files.len(),
+    })
+}
+
+fn capture_policy_files(sources: &PolicySources) -> Result<Vec<CapturedPolicyFile>, String> {
+    let policy_dir = sources
+        .policy_dir
+        .as_ref()
+        .ok_or_else(|| "GANTRY_POLICY_DIR is not configured".to_string())?;
     let mut files = Vec::new();
     collect_rego_files(policy_dir, &mut files).map_err(|error| {
         format!(
@@ -440,21 +504,22 @@ fn load_rego_policy_dir(policy_dir: &Path) -> Result<RegoPolicy, String> {
         ));
     }
 
-    files.sort();
-    let mut engine = RegoEngine::new();
-    for file in &files {
-        let source = std::fs::read_to_string(file)
-            .map_err(|error| format!("failed reading '{}': {error}", file.display()))?;
-
-        engine
-            .add_policy(file.to_string_lossy().into_owned(), source)
-            .map_err(|error| format!("failed compiling '{}': {error}", file.display()))?;
+    if let Some(directory) = &sources.filesystem_dir {
+        files
+            .extend(profile_files(directory).map_err(|error| {
+                format!("failed reading filesystem profile directory: {error}")
+            })?);
     }
+    files.sort();
 
-    Ok(RegoPolicy {
-        engine,
-        module_count: files.len(),
-    })
+    files
+        .into_iter()
+        .map(|path| {
+            let contents = std::fs::read(&path)
+                .map_err(|error| format!("failed reading '{}': {error}", path.display()))?;
+            Ok(CapturedPolicyFile { path, contents })
+        })
+        .collect()
 }
 
 fn collect_rego_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
@@ -476,70 +541,20 @@ fn collect_rego_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io:
 }
 
 fn fingerprint_sources(sources: &PolicySources) -> Result<PolicyFingerprint, String> {
-    let policy_dir = sources
-        .policy_dir
-        .as_ref()
-        .ok_or_else(|| "GANTRY_POLICY_DIR is not configured".to_string())?;
-    let mut files = Vec::new();
-    collect_rego_files(policy_dir, &mut files).map_err(|error| {
-        format!(
-            "failed reading policy directory '{}': {error}",
-            policy_dir.display()
-        )
-    })?;
-
-    if files.is_empty() {
-        return Err(format!(
-            "no .rego files found under policy directory '{}'",
-            policy_dir.display()
-        ));
-    }
-
-    files.sort();
-    if let Some(filesystem_dir) = &sources.filesystem_dir {
-        match std::fs::read_dir(filesystem_dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(|error| {
-                        format!(
-                            "failed reading filesystem profile directory '{}': {error}",
-                            filesystem_dir.display()
-                        )
-                    })?;
-                    let path = entry.path();
-                    if path.extension().and_then(|value| value.to_str()) == Some("toml") {
-                        files.push(path);
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed reading filesystem profile directory '{}': {error}",
-                    filesystem_dir.display()
-                ));
-            }
-        }
-    }
-    files.sort();
-    fingerprint_files(&files)
-        .map_err(|error| format!("failed fingerprinting policy generation: {error}"))
+    Ok(fingerprint_captured_files(&capture_policy_files(sources)?))
 }
 
-fn fingerprint_files(files: &[PathBuf]) -> Result<PolicyFingerprint, std::io::Error> {
-    let mut fingerprint_files = Vec::with_capacity(files.len());
-    for file in files {
-        let contents = std::fs::read(file)?;
-        let digest: [u8; 32] = Sha256::digest(&contents).into();
-        fingerprint_files.push(PolicyFileFingerprint {
-            path: file.clone(),
-            digest,
-        });
+fn fingerprint_captured_files(files: &[CapturedPolicyFile]) -> PolicyFingerprint {
+    let fingerprints = files
+        .iter()
+        .map(|file| PolicyFileFingerprint {
+            path: file.path.clone(),
+            digest: Sha256::digest(&file.contents).into(),
+        })
+        .collect();
+    PolicyFingerprint {
+        files: fingerprints,
     }
-
-    Ok(PolicyFingerprint {
-        files: fingerprint_files,
-    })
 }
 
 fn parse_decision(

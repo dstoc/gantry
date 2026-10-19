@@ -63,14 +63,12 @@ struct MountDocument {
     size: Option<String>,
 }
 
-/// Load the direct `filesystems/*.toml` profiles associated with a policy directory.
+/// List the direct `filesystems/*.toml` profiles associated with a policy directory.
 /// A missing directory means no profiles are configured; a selected profile then fails closed.
-pub(crate) fn load_profiles(
-    directory: &Path,
-) -> Result<BTreeMap<String, FilesystemProfile>, FilesystemProfileError> {
+pub(crate) fn profile_files(directory: &Path) -> Result<Vec<PathBuf>, FilesystemProfileError> {
     let metadata = match fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
             return Err(FilesystemProfileError::Directory {
                 path: directory.to_path_buf(),
@@ -100,18 +98,35 @@ pub(crate) fn load_profiles(
         }
     }
     paths.sort();
+    for path in &paths {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| invalid(path, error.to_string()))?;
+        if !metadata.file_type().is_file() {
+            return Err(invalid(
+                path,
+                "profile must be a regular file, not a symlink or special file",
+            ));
+        }
+    }
 
+    Ok(paths)
+}
+
+/// Parse profiles from the exact bytes captured with the Rego source files.
+pub(crate) fn load_profiles_from_sources(
+    files: &[(PathBuf, Vec<u8>)],
+) -> Result<BTreeMap<String, FilesystemProfile>, FilesystemProfileError> {
     let mut profiles = BTreeMap::new();
-    for path in paths {
-        let profile = load_profile(&path)?;
+    for (path, contents) in files {
+        let profile = load_profile(path, contents)?;
         if profiles.insert(profile.name.clone(), profile).is_some() {
-            return Err(invalid(&path, "duplicate profile name"));
+            return Err(invalid(path, "duplicate profile name"));
         }
     }
     Ok(profiles)
 }
 
-fn load_profile(path: &Path) -> Result<FilesystemProfile, FilesystemProfileError> {
+fn load_profile(path: &Path, contents: &[u8]) -> Result<FilesystemProfile, FilesystemProfileError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| invalid(path, error.to_string()))?;
     if !metadata.file_type().is_file() {
         return Err(invalid(
@@ -124,9 +139,9 @@ fn load_profile(path: &Path) -> Result<FilesystemProfile, FilesystemProfileError
         .and_then(|value| value.to_str())
         .ok_or_else(|| invalid(path, "profile name is not valid UTF-8"))?;
     validate_profile_name(name).map_err(|details| invalid(path, details))?;
-    let source = fs::read_to_string(path).map_err(|error| invalid(path, error.to_string()))?;
+    let source = std::str::from_utf8(contents).map_err(|error| invalid(path, error.to_string()))?;
     let document: ProfileDocument =
-        toml::from_str(&source).map_err(|error| invalid(path, error.to_string()))?;
+        toml::from_str(source).map_err(|error| invalid(path, error.to_string()))?;
     if document.version != PROFILE_VERSION {
         return Err(invalid(
             path,
@@ -207,6 +222,21 @@ fn load_profile(path: &Path) -> Result<FilesystemProfile, FilesystemProfileError
         name: name.to_string(),
         mounts,
     })
+}
+
+#[cfg(test)]
+fn load_profiles(
+    directory: &Path,
+) -> Result<BTreeMap<String, FilesystemProfile>, FilesystemProfileError> {
+    let files = profile_files(directory)?;
+    let sources = files
+        .into_iter()
+        .map(|path| {
+            let contents = fs::read(&path).map_err(|error| invalid(&path, error.to_string()))?;
+            Ok((path, contents))
+        })
+        .collect::<Result<Vec<_>, FilesystemProfileError>>()?;
+    load_profiles_from_sources(&sources)
 }
 
 pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
