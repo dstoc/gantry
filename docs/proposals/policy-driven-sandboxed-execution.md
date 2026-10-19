@@ -380,7 +380,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 
 **Filesystem (Bubblewrap):** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Direct retains the Gantry process filesystem view. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
 
-**Network:** no direct external route, reachable parent proxy, or cross-command proxy connection. The selected Baffle UDS is the sole external-egress capability. No control socket or credential secret is visible inside the sandbox. Proxy failures never trigger direct fallback.
+**Network (Bubblewrap):** no direct external route, reachable parent proxy, or cross-command proxy connection. The selected Baffle UDS is the sole external-egress capability. No control socket or credential secret is visible inside the sandbox. Proxy failures never trigger direct fallback.
 
 **Lifecycle:** per-invocation namespaces and leases; all descendants, listeners and session resources cleaned up after completion and cancellation. Concurrency does not share authority accidentally.
 
