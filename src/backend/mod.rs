@@ -24,13 +24,19 @@ pub(crate) async fn start(
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn host_has_required_bubblewrap() -> bool {
+    bubblewrap_test_environment_error().is_none()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn bubblewrap_test_environment_error() -> Option<String> {
     let Some(executable) = ["/usr/bin/bwrap", "/bin/bwrap"]
         .into_iter()
         .find(|path| std::path::Path::new(path).is_file())
     else {
-        return false;
+        return Some("bubblewrap executable was not found".to_owned());
     };
-    std::process::Command::new(executable)
+
+    let output = match std::process::Command::new(executable)
         .args([
             "--unshare-user",
             "--unshare-pid",
@@ -53,16 +59,31 @@ pub(crate) fn host_has_required_bubblewrap() -> bool {
         ])
         .env_clear()
         .output()
-        .is_ok_and(|output| output.status.success())
+    {
+        Ok(output) => output,
+        Err(error) => return Some(format!("failed to start {executable}: {error}")),
+    };
+
+    if output.status.success() {
+        None
+    } else {
+        Some(format!(
+            "{executable} exited with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 #[test]
 fn required_bubblewrap_test_environment_is_available() {
     if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_some() {
-        assert!(
-            host_has_required_bubblewrap(),
-            "Bubblewrap integration tests were required, but the configured namespaces are unavailable"
-        );
+        if let Some(error) = bubblewrap_test_environment_error() {
+            panic!(
+                "Bubblewrap integration tests were required, but the configured namespaces are unavailable: {error}"
+            );
+        }
     }
 }
