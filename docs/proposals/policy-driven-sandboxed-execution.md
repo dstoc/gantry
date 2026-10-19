@@ -394,7 +394,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
 | Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands, authorized CWD selection, and spawn failures for missing or inaccessible CWD paths. No TOCTOU/identity-pinning tests. |
-| Network | `baffle_session: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
+| Network | Bubblewrap with `baffle_session: null` has no external network; Baffle session rules remain enforced; Direct inherits Gantry networking and requires a null Baffle selection. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
 | Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
