@@ -1,0 +1,553 @@
+# Proposal: Policy-Driven Sandboxed Execution
+
+**Project:** Gantry  
+**Status:** Draft  
+**Scope:** Gantry only  
+**Prerequisite:** The `mcp-run` → `gantry` rename and repository extraction are complete and not part of this proposal.
+
+## Summary
+
+Evolve Gantry from a policy-enforced command runner into a **policy-driven execution system offering both sandboxed and direct command execution**. Rego authorizes the requested command and selects:
+
+- A **filesystem profile** (a named profile or `null`) describing filesystem requirements independently of the selected backend.
+- An optional **Baffle session configuration filename**, which controls network access.
+
+The **operator selects the backend at startup** using `--backend bubblewrap` (the default) or `--backend direct`. Rego supplies filesystem and Baffle requirements; Gantry rejects decisions the selected backend cannot support. Bubblewrap requires a named filesystem profile, isolates each command, and optionally provisions Baffle through `gantry-supervisor`. Direct requires both policy fields to be `null` and retains Gantry's current `tokio::process::Command` execution path without Bubblewrap or a supervisor.
+
+Every Bubblewrap execution receives an isolated filesystem and network namespace. Direct retains Gantry's existing process/filesystem/network access and requires the explicit `--backend direct` flag; it is **never** a fallback after Bubblewrap failure. Authorization remains mandatory for both backends. Existing MCP, raw streaming and check interfaces remain the entry points.
+
+## Motivation and existing behaviour
+
+Gantry currently evaluates a boolean Rego query, `data.sandbox.main.allow`, then executes the resolved command directly using `tokio::process::Command`. Rego can inspect the requested command, resolved path, executable SHA-256, arguments, forwarded environment, and a trusted working-directory label. The `POST /check` and MCP `check_command` paths share pre-spawn authorization with actual execution. The new design preserves shared authorization: Direct keeps the existing spawning path, while Bubblewrap delegates spawning to its supervisor.
+
+A boolean approval alone cannot distinguish a command allowed to read a checkout, one allowed to change it, or one permitted to contact a narrowly specified API with injected credentials. Nor can a shared parent-container proxy provide independent network authority to two simultaneous commands when either can connect to the same socket or listener.
+
+Sandboxed invocations receive their own filesystem view and network namespace, while Baffle retains responsibility for HTTPS policy, destination/path restrictions and credential injection. Direct invocations intentionally preserve Gantry's existing unsandboxed execution semantics.
+
+## Goals
+
+1. Extend Rego to return a single structured decision containing `allow`, `filesystem`, and `baffle_session`.
+2. Select a named filesystem profile or `null`, and optionally a Baffle configuration filename, without choosing the backend through Rego. The backend is selected by the startup CLI flag.
+3. Implement **Bubblewrap and Direct** execution backends with a common execution lifecycle; Baffle is the only managed network integration.
+4. Create an isolated filesystem, process environment and network namespace for every Bubblewrap command, while retaining the existing execution model for Direct.
+5. Give each network-authorized command a unique ephemeral Baffle session and only that session's data socket.
+6. Implement a local HTTP-proxy-compatible TCP-to-UDS bridge in Rust, without `socat` or another long-running external bridge service.
+7. Preserve current no-shell command semantics, trusted CWD input to Rego, authorized command forwarding, streamed output, exit reporting, and cancellation.
+8. Reject Rego decisions incompatible with the startup-selected backend, fail closed on backend preparation errors, and never fall back from Bubblewrap to Direct.
+9. Keep future OCI/microVM backends possible without changing Rego policy names or semantics.
+
+## Non-goals
+
+- Changes to Cladding, its container topology, or its mount configuration.
+- Changes to the Baffle daemon, v2 control protocol, or session policy syntax.
+- Implementing other execution backends beyond Bubblewrap and Direct.
+- Arbitrary mounts, backend selection through Rego or individual command requests, or Baffle session creation requested by an untrusted caller.
+- Network providers other than Baffle, general network-provider APIs, and separate network-profile mappings.
+- Adding unrestricted direct network access to **Bubblewrap**, shell interpolation, or a generic network-forwarding service. Direct intentionally inherits the ambient networking of the Gantry process.
+- A complete resource quota framework; memory, CPU, and PID limits can be designed separately.
+
+## Proposed architecture
+
+```text
+MCP /raw /check request
+         |
+         v
+Trusted resolution + Rego authorization
+  -> { allow, filesystem, baffle_session }
+         |
+         v
+Execution planner
+  - Use startup-selected backend (default: bubblewrap)
+  - Validate policy requirements against backend
+  - Carry forward authorized path, args, env and CWD
+         |
+         +-- --backend direct -----------> Direct (explicit CLI flag)
+         |                                - Existing Command::new(path)
+         |                                - Gantry's ambient filesystem/network
+         |                                - No bwrap, supervisor, or Baffle lease
+         |
+         +-- --backend bubblewrap -------> Bubblewrap (default)
+                                          - Apply selected profile mounts
+                                          - Isolate PID/mount/network namespaces
+                                          - Optional leased Baffle session
+                                          - Supervisor and TCP-to-UDS bridge
+
+Command exit -> output/status and backend-specific cleanup
+
+
+```
+
+**Boundary:** The startup CLI flag selects the backend independently of Rego. Rego specifies required filesystem and Baffle access; Gantry checks compatibility before execution. Direct requires both fields to be `null`, while Bubblewrap requires a named filesystem profile. Command callers and policies cannot change the configured backend, and Bubblewrap failures never downgrade to Direct.
+
+## Server command-line and environment configuration
+
+Gantry's server accepts command-line flags for its listener, policy directory, and execution backend. The server configuration is separate from the `run-remote` client interface.
+
+| Command-line option | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `--bind-addr <HOST:PORT>` | `GANTRY_BIND_ADDR` | `127.0.0.1:8000` when no UDS is selected | Listen over TCP for `/mcp`, `/raw`, and `/check`. |
+| `--bind-uds <ABSOLUTE_PATH>` | `GANTRY_BIND_UDS` | Unset | Listen for the same endpoints on a Unix domain socket instead of TCP. |
+| `--policy-dir <PATH>` | `GANTRY_POLICY_DIR` | Unset (deny-all) | Root directory containing Rego policy files. |
+| `--backend <bubblewrap|direct>` | None | `bubblewrap` | Select one execution backend for the server instance; Direct requires explicit CLI selection. |
+
+**Precedence and validation:**
+
+- Explicit command-line configuration takes precedence over environment configuration. When either listener flag is supplied, it selects the listener type and overrides **both** listener environment variables; supplying both `--bind-addr` and `--bind-uds` is an error.
+- Without a listener flag, `GANTRY_BIND_ADDR` and `GANTRY_BIND_UDS` are mutually exclusive if both are set to nonempty values. If neither is supplied, bind `127.0.0.1:8000`.
+- `--policy-dir` overrides `GANTRY_POLICY_DIR`. An unset policy directory retains Gantry's fail-closed deny-all behavior; invalid policy loading also remains deny-all.
+- Validate the TCP address, require an absolute UDS path with an existing parent directory, and reject malformed CLI values and unknown flags. Continue the existing UDS socket-file handling.
+- `--backend` is CLI-only and defaults to Bubblewrap; there is no `GANTRY_BACKEND` variable or separate Direct-enable setting in this proposal.
+- Rename the existing server environment variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` to `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`. The old names are **not** aliases or fallbacks after migration. Document this breaking configuration change for deployments.
+- These are server settings; the `run-remote` client's `RUN_REMOTE_SERVER` and `RUN_REMOTE_SOCKET` are unchanged.
+
+Example:
+
+```sh
+gantry --bind-addr 127.0.0.1:8000 --policy-dir /etc/gantry/policies
+gantry --bind-uds /run/gantry/gantry.sock --policy-dir /etc/gantry/policies
+GANTRY_POLICY_DIR=/etc/gantry/policies GANTRY_BIND_UDS=/run/gantry/gantry.sock gantry
+gantry --backend direct --policy-dir /etc/gantry/direct-policies
+```
+
+## 1. Rego decision contract
+
+### Single structured decision
+
+Replace the boolean query with a single object evaluated from a consistent compiled policy snapshot. Initially preserve the existing `sandbox` package namespace, using:
+
+`data.sandbox.main.decision`
+
+Example:
+
+```rego
+package sandbox.main
+
+default decision := {
+    "allow": false,
+    "filesystem": null,
+    "baffle_session": null,
+}
+
+decision := {
+    "allow": true,
+    "filesystem": "workspace-readonly",
+    "baffle_session": "github-readonly.toml",
+} if {
+    input.command == "gh"
+    count(input.args) >= 2
+    input.args[0] == "pr"
+    input.args[1] == "view"
+    # Additional executable/hash/cwd/env constraints as needed.
+}
+
+decision := {
+    "allow": true,
+    "filesystem": "workspace-write",
+    "baffle_session": null,
+} if {
+    input.command == "cargo"
+    input.args == ["test"]
+}
+
+# Compatible with --backend direct; rejected under the default Bubblewrap backend.
+decision := {
+    "allow": true,
+    "filesystem": null,
+    "baffle_session": null,
+} if {
+    input.command == "date"
+    count(input.args) == 0
+}
+```
+
+| Field | Type | Contract |
+| --- | --- | --- |
+| `allow` | boolean | Required; only `true` permits execution. |
+| `filesystem` | string or null | Required; a named profile is required under Bubblewrap; `null` is required under Direct. Does not select the backend. |
+| `baffle_session` | string or null | Required; with Bubblewrap, `null` denies external network and a filename selects Baffle; Direct requires `null` and retains ambient network access. |
+
+For a denied decision, only `allow: false` has effect. For an allowed decision, an invalid named filesystem profile, malformed Baffle filename, undefined result, malformed type or conflicting decisions must deny execution. **The `--backend` CLI flag selects the backend, not these fields.** Direct requires `filesystem: null` and `baffle_session: null`; Bubblewrap requires a named filesystem profile. Any incompatible combination is an authorization/validation error; never change backends implicitly. `baffle_session: null` provides network isolation **only with Bubblewrap**.
+
+Evaluate authorization and profile selection together, not as unrelated queries against potentially different policy generations. Preserve command-specific `data.sandbox[...].allow` modules where useful by adapting the router policy. Retaining `sandbox` avoids coupling this change to an unrelated Rego package rename; changing the package name can be a separate migration.
+
+Rego must not return raw filesystem paths, mount flags, Baffle credentials, or runtime-created session IDs. It selects only a trusted Baffle **configuration filename**. The caller's request shape stays unchanged.
+
+### Checks
+
+`POST /check`, MCP `check_command`, and `run-remote --check` report the selected names and the configured backend while retaining existing executable, hash, cwd, policy-mode and denial diagnostics:
+
+```json
+{
+  "allowed": true,
+  "reason": null,
+  "filesystem": "workspace-readonly",
+  "baffle_session": "github-readonly.toml",
+  "backend": "bubblewrap"
+}
+```
+
+A check reports the startup-selected backend and validates the `filesystem`/`baffle_session` combination against it. It may validate filesystem-profile existence/schema and Baffle filename syntax, but **must not** create a Baffle session, mount filesystems or spawn either backend. It remains advisory and point-in-time: the real execution reauthorizes and may fail during provisioning. Explicitly document migration from the current boolean `allow` contract. A compatibility mode, if offered, must not imply an unrestricted filesystem by default.
+
+## 2. Filesystem policies with direct source paths
+
+### Named declarative profiles
+
+Rego selects a named filesystem profile. Each administrator-controlled profile specifies **source paths directly**; there is no additional named-resource registry or resource-to-path mapping.
+
+Proposed layout:
+
+```text
+config/
+  policies/
+    main.rego
+    gh.rego
+    cargo.rego
+  filesystems/
+    workspace-readonly.toml
+    workspace-write.toml
+    minimal.toml
+```
+
+Example `filesystems/workspace-readonly.toml`:
+
+```toml
+version = 1
+
+[[mounts]]
+source = "/srv/workspace"
+target = "/workspace"
+access = "read-only"
+
+[[mounts]]
+type = "tmpfs"
+target = "/tmp"
+size = "256MiB"
+```
+
+A writable profile can specify `access = "read-write"`. Paths are absolute **within the trusted Gantry runtime**, not necessarily on the physical host. No untrusted caller or Rego expression may supply or override source paths, destinations, or access modes; Rego selects only the profile name.
+
+### Path validation and mount safety
+
+- Parse profiles only from administrator-controlled files.
+- Resolve source paths in trusted code; reject traversal, symlink races, unsafe file types, conflicting targets and protected-target shadowing.
+- Pin opened source objects before applying mounts, preferably with Bubblewrap's descriptor-based `--bind-fd`/`--ro-bind-fd` (where available) or another race-resistant equivalent. Validate backend version and required capabilities; fail closed if unavailable.
+- Read-only mounts constrain writes *from the command* but do not freeze changes by other processes. Consider nested mounts and unintended writable submounts.
+- Filesystem profiles are **allowlists**; they are not mounted on top of an inherited unrestricted root filesystem.
+
+### Minimal trusted runtime root
+
+The backend must construct a limited runtime view containing the authorized executable, required interpreter/libraries, essential system files, a suitable `/proc`, and private temporary state. This baseline is not the entire parent filesystem and must not expose credentials, control sockets, or unrelated application data.
+
+A selected profile adds only its declared direct-path mounts to that baseline. If the authorized executable or cwd cannot be represented without expanding access, reject execution.
+
+### Filesystem invariants
+
+- Ensure authorized mount sources correspond to the objects actually mounted, avoiding re-resolution through mutable paths.
+- Gantry retains trusted CWD resolution for the Rego input, then passes the authorized CWD path to the supervisor. The supervisor uses that path as its working directory inside the sandbox. If unavailable or inaccessible, command spawning fails. No descriptor handoff or directory identity verification is required.
+- Preserve the executable path selected by authorization in the sandbox filesystem and pass it unchanged to the supervisor; the executable's contents need not be pinned against intervening writes (see §5).
+- Scrub inherited file descriptors and environment variables.
+- Writable mounts are genuinely writable and need not be disposable.
+
+## 3. Direct Baffle session selection
+
+### Rego selects a configuration filename
+
+**Baffle is the only network integration in scope.** There is no general network-provider abstraction and no Gantry network-profile mapping layer.
+
+The Rego decision's `baffle_session` is either `null` (no managed Baffle session) or a filename relative to Baffle's administrator-controlled `session_config_dir`. Direct requires `null`:
+
+```json
+{
+  "allow": true,
+  "filesystem": "workspace-readonly",
+  "baffle_session": "github-readonly.toml"
+}
+```
+
+This is a Baffle **session configuration filename**, not the runtime-generated Baffle session ID or socket path. Gantry validates the name and Baffle performs its file-only ownership, symlink and contents checks when creating the session. The filename comes from Rego, never the untrusted command request.
+
+Example Baffle configuration:
+
+```toml
+version = 2
+persistent = false
+unmatched = "deny"
+
+[rules."api.github.com"]
+paths = ["/repos/dstoc/**"]
+```
+
+Omit `socket_name` so concurrently provisioned sessions receive unique data socket paths. Require ephemeral sessions; failed provisioning prevents command startup.
+
+### Trusted Baffle integration
+
+Gantry uses Baffle's existing `baffle-client` and `create_from_file` operation directly. If deployment requires a privileged broker, it exposes a constrained create/lease interface but **does not** introduce another network provider or policy mapping.
+
+Trusted Gantry execution state holds the ephemeral session lease for the complete command/process-tree lifetime, releasing it on success, cancellation, spawn failure and unexpected termination. Only the assigned Baffle **data** socket is exposed inside the sandbox; never the control socket or credentials.
+
+### No Baffle session in Bubblewrap
+
+With `filesystem` set to a named profile and `baffle_session: null`, the command runs in an isolated network namespace, without an external route, any Baffle socket, or injected proxy configuration. Private loopback may be used within the invocation. Caller-supplied proxy and bypass environment variables cannot override this restriction.
+
+## 4. Pluggable execution backends
+
+Introduce a backend-neutral validated plan, plus a lifecycle-bearing handle:
+
+```rust
+trait ExecutionBackend {
+    async fn start(&self, plan: ExecutionPlan)
+        -> Result<RunningExecution>;
+}
+```
+
+`ExecutionPlan` contains the authorized absolute executable path (and the hash used in the policy decision for diagnostics), exact argument vector, authorized CWD path, sanitized environment, validated filesystem source descriptors and access modes, optional leased Baffle data endpoint, stdio configuration, and isolation/lifecycle constraints. The backend forwards the authorized invocation instead of re-resolving the requested command.
+
+`RunningExecution` supports streamed output, exit status, cancellation and cleanup. Exact Rust type and ownership details are implementation decisions; the important property is **no orphaned process tree or leaked Baffle lease** when the caller disconnects or execution fails.
+
+The `--backend` startup option selects the backend for the Gantry instance; default `bubblewrap`, explicit opt-in `direct`. Rego never selects it. Direct keeps the current `tokio::process::Command` behavior. Unsupported policy requirements cause an error, and failed Bubblewrap execution never falls back to Direct.
+
+### Backend selection and compatibility
+
+The operator selects a single backend for the Gantry instance:
+
+```sh
+gantry                         # bubblewrap (default)
+gantry --backend bubblewrap    # explicit sandboxing
+gantry --backend direct        # opt into current direct execution
+```
+
+| CLI backend | Rego `filesystem` | Rego `baffle_session` | Result |
+| --- | --- | --- | --- |
+| `bubblewrap` | Named profile | `null` | Isolated, no external network |
+| `bubblewrap` | Named profile | Baffle filename | Isolated, Baffle networking |
+| `bubblewrap` | `null` | Any | Error |
+| `direct` | `null` | `null` | Existing unsandboxed execution |
+| `direct` | Named profile | Any | Error |
+| `direct` | `null` | Baffle filename | Error |
+
+The backend does not change per command. An unsupported policy requirement fails before spawn; never retry with a different backend.
+
+Use capability validation before provisioning. Concurrent runs must each retain their own immutable policy/profile snapshot and execution ownership.
+
+### Direct backend
+
+Direct preserves the current Gantry execution path: after authorization, spawn the resolved executable using `tokio::process::Command` with its authorized arguments, environment and CWD. Keep existing stdio, streaming, exit and cancellation behavior.
+
+Direct does not use Bubblewrap, a per-command filesystem policy, a supervisor, a Baffle lease or a command-local bridge. It inherits Gantry's filesystem and network environment, including any existing proxy configuration. Only explicit `--backend direct` selects it; its policy decision must contain `filesystem: null` and `baffle_session: null`.
+
+A missing/invalid filesystem field is an error regardless of the selected backend. A failed Bubblewrap execution must not retry through Direct.
+
+## 5. Bubblewrap backend
+
+### Per-invocation isolation
+
+Spawn a new Bubblewrap sandbox for **every** command with a named filesystem profile, including those without a Baffle session. Configure a private mount namespace, PID namespace, and network namespace (using `--unshare-net`) with appropriate user namespace, session, capability and inherited-descriptor restrictions. Do not rely on the parent container's default filesystem/proxy access as the child's security policy.
+
+Construct the filesystem view explicitly from the trusted runtime baseline plus the selected profile's mounts. Create private `/proc` and temporary filesystem views appropriate to the PID and mount namespace. Use `--die-with-parent`, `--new-session`, and process-group/cgroup cleanup as applicable, but verify that descendant processes cannot outlive a completed or cancelled execution.
+
+Nested user/network namespaces may be blocked by kernel settings, seccomp, or rootless container configuration. Detect unsupported environments clearly. **Never fall back to unsandboxed command execution.**
+
+### Per-command localhost bridge
+
+Inside the sandbox run a small Rust binary, **`gantry-supervisor`**, whose responsibilities are:
+
+1. Receive the **authorized invocation** from trusted Gantry code: the resolved absolute executable path, exact argument vector, effective working directory and sanitized environment. Do not accept a separate, caller-supplied executable or resolve the original command name through `PATH`.
+2. Receive the assigned Baffle data UDS path, if networking was authorized.
+3. Verify the private loopback interface is available, then bind `127.0.0.1:3128`.
+4. For each TCP client, connect to the assigned Unix socket and forward bytes bidirectionally with Tokio.
+5. Confirm bridge readiness, then spawn the authorized absolute path directly with the same arguments, cwd and environment (subject only to Gantry's trusted sandbox/proxy environment setup).
+6. Supervise the command process tree, relay stdout/stderr and exit status, and terminate listeners and descendants on completion/cancellation.
+
+Each invocation has its own network namespace and can reuse the same port:
+
+```text
+Command A: 127.0.0.1:3128 -> Baffle session A UDS
+Command B: 127.0.0.1:3128 -> Baffle session B UDS
+```
+
+Expose **only the assigned Baffle data UDS** in the sandbox, at a fixed location such as `/run/gantry/proxy.sock`. Never mount the parent Baffle session directory, provider control socket, or another command's socket. Validate live pathname UDS bind mounts across user/mount/network namespaces; fail closed if isolation is unavailable.
+
+Set trusted `http_proxy`, `https_proxy`, `HTTP_PROXY` and `HTTPS_PROXY` to `http://127.0.0.1:3128` only when Baffle is authorized. Caller-provided `ALL_PROXY`, `NO_PROXY` and other proxy/bypass variables cannot redirect traffic. Provide only the public Baffle CA when needed; never its private key or credential files. Baffle retains HTTPS CONNECT, host/path, and credential-injection enforcement.
+
+The supervisor is **inside** the isolation boundary and has no Baffle control authority.
+
+### Authorized command handoff
+
+Gantry currently resolves the executable path and hashes its contents before evaluating Rego, then passes that resolved path into `Command::new(resolved_executable)` when launching the command. Retain this model even though actual process creation moves to `gantry-supervisor`.
+
+**Required sequence:**
+
+1. Gantry resolves the requested executable to an **absolute path**, calculates its SHA-256 for the existing Rego check, and authorizes the command, arguments, environment and trusted cwd label.
+2. Gantry builds a typed internal **`AuthorizedInvocation`** carrying the *same resolved executable path*, exact authorized arguments, effective environment and CWD path. These are trusted execution-plan values, not a second command request or an opportunity for untrusted policy/profile overrides.
+3. The Bubblewrap backend makes that executable path available at the **same absolute location** inside the sandbox, using the trusted runtime baseline and/or authorized mounts. If that path cannot be executed within the filesystem policy, fail rather than running some alternative executable.
+4. Gantry passes the authorized invocation to the supervisor through a trusted launch channel (for example, process arguments or a private pipe). The supervisor must not search `PATH`, re-resolve the original command token, or evaluate Rego again. It calls `Command::new(authorized_absolute_path)` directly, sets the supplied arguments, cwd and sanitized environment, and spawns the child without a shell.
+5. The supervisor sets the authorized CWD path as the command's working directory inside the sandbox. A missing or inaccessible CWD causes a spawn error. No CWD descriptor handoff or identity verification is required.
+
+**Explicit non-goal: executable TOCTOU protection.** The hash remains a point-in-time Rego input. Gantry does not need to preserve the executable inode or bytes against renames, replacements or in-place writes after authorization. Such changes are permitted by this design, as with Gantry's existing path-based spawn. No sealed snapshots, executable memfds, `execveat` handoffs, sealed manifests, or executable-byte equivalence tests are required.
+
+The resolved path and sandbox filesystem mapping must remain consistent as an execution *interface*: passing `/usr/bin/gh` must not accidentally start an unrelated binary at that path because of a different mount layout selected by the backend. This is a configuration correctness requirement, not a promise to defeat concurrent executable modifications. Verify ordinary ELF and shebang execution work through the new supervisor path.
+
+### Lifetime and cancellation
+
+```text
+Authorize request and resolve profiles
+  -> Validate backend capabilities
+  -> Provision Baffle lease if needed
+  -> Prepare namespace and mount plan
+  -> Start bwrap + supervisor
+  -> Confirm bridge readiness
+  -> Spawn and supervise authorized command
+  -> Stream and report output/status
+  -> Terminate descendants and supervisor
+  -> Release network lease
+```
+
+Ensure cleanup on all intermediate errors (bad mounts, missing executable, bridge bind/connect failures, client disconnects, cancelled futures, server shutdown). Do not report a successful `start` event until the sandbox is ready and the authorized command has actually started. Explicitly separate sandbox setup errors from the command's nonzero exit status.
+
+## 6. Public API and compatibility
+
+Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for MCP, `/raw`, and `/check` callers. Gantry selects profiles itself; a caller cannot override them.
+
+- Extend check responses to include policy fields and the startup-configured backend while retaining current fields and exit conventions.
+- Preserve existing MCP command output and `/raw` stdout/stderr streaming, output limits, exit codes and disconnect semantics.
+- Refactor synchronous `spawn_command_process` and the shared authorization path as needed because Baffle provisioning and backend startup are asynchronous. Keep authorization shared between all execution paths.
+- Document migration from `data.sandbox.main.allow` to structured decisions; Direct deployments explicitly use `--backend direct` and both-null policy fields. Missing fields never imply Direct. Rename the legacy server variables to `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR` without retaining aliases.
+- Retain deny-all behaviour on policy startup/reload errors. Load Rego and direct-path filesystem profiles into coherent immutable generations; validate Baffle filenames against the configured session directory before provisioning; do not combine values from incompatible reload generations.
+
+## 7. Security acceptance requirements
+
+**Authorization:** one Rego decision, from verified input, selects no caller-controlled mount paths or Baffle sessions. Reject malformed/unknown values. Pass the authorized absolute executable path and exact invocation to the supervisor without further command-name resolution; retain the point-in-time Rego hash check and trusted CWD input. Do not claim executable TOCTOU protection.
+
+**Filesystem (Bubblewrap):** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Direct retains the Gantry process filesystem view. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
+
+**Network (Bubblewrap):** no direct external route, reachable parent proxy, or cross-command proxy connection. The selected Baffle UDS is the sole external-egress capability. No control socket or credential secret is visible inside the sandbox. Proxy failures never trigger direct fallback.
+
+**Lifecycle:** per-invocation namespaces and leases; all descendants, listeners and session resources cleaned up after completion and cancellation. Concurrency does not share authority accidentally.
+
+**Backend:** an unsupported or failed sandbox requirement cannot be ignored or downgraded. Rootless deployment restrictions fail clearly, without implicit unsandboxed execution.
+
+## 8. Testing and validation
+
+| Area | Essential tests |
+| --- | --- |
+| Rego | Allow/deny, differing filesystem/Baffle-file selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
+| `/check` | Reports policy fields and the startup-selected backend; checks their compatibility without Baffle creation or process spawn; real execution reauthorizes. |
+| Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
+| Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands, authorized CWD selection, and spawn failures for missing or inaccessible CWD paths. No TOCTOU/identity-pinning tests. |
+| Network | Bubblewrap with `baffle_session: null` has no external network; Baffle session rules remain enforced; Direct inherits Gantry networking and requires a null Baffle selection. |
+| Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
+| Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
+| Backend selection | Without a flag, Bubblewrap is selected; `--backend direct` runs existing execution only for both-null policy fields. Verify incompatible combinations fail and Bubblewrap errors never trigger Direct. |
+| Server configuration | CLI-over-environment precedence; TCP/UDS exclusivity; default TCP bind; UDS path validation; missing/invalid policy directory deny-all; unprefixed legacy variables ignored; client `RUN_REMOTE_*` unaffected. |
+| Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
+
+Include negative tests that deliberately attempt to connect to the parent proxy listener, open other Baffle session sockets, access protected filesystem paths, and use direct TCP egress.
+
+## 9. Concrete implementation plan
+
+### Phase 0 — Feasibility complete; proceed to implementation
+
+Manual smoke tests **passed in the intended Bubblewrap/Podman environment**:
+
+| Test | Observed result |
+| --- | --- |
+| Nested Bubblewrap user, mount, PID and network namespaces | Sandbox started |
+| Local TCP listener/client on `127.0.0.1` | Passed |
+| Direct external TCP from isolated namespace | Blocked |
+| TCP-to-UDS bridge through a bind-mounted **mock** live Unix socket using `socat` | Passed |
+| Terminating a Bubblewrap launcher with a child process | No matching orphan observed |
+| Launch absolute executable with an intended CWD; reject absent CWD | Both passed |
+
+These are **feasibility smoke tests**, not proof of full isolation or lifecycle correctness. They used a temporary broad read-only root mount; they did not prove other Baffle sockets are hidden, exercise an actual Baffle HTTPS CONNECT, or test Baffle lease release. **Do not hold Phase 1 on further standalone spikes.** Perform those checks as ordinary Phase 3–4 implementation/integration tests; they remain release acceptance requirements.
+
+### Phase 1 — CLI, structured authorization, and planning
+
+**Code locations:** `src/main.rs`, `src/mcp.rs` (move config parsing into `src/config.rs` if useful), `src/policy.rs`, `src/executor.rs`, plus new `src/filesystem.rs` and `src/execution.rs`.
+
+1. **Server arguments/config:** Implement `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend` with `clap` or an equivalently tested parser. Default backend is Bubblewrap. Read only `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`; remove legacy environment lookups and update errors, README, and MCP instructions. Apply the CLI-over-environment listener precedence specified above, and reject invalid/dual bind flags.
+2. **Structured Rego result:** Replace `data.sandbox.main.allow` with `data.sandbox.main.decision` in `src/policy.rs`. Deserialize to a typed `PolicyDecision { allow, filesystem, baffle_session }`. For `allow: true`, require both profile fields to be **present** (an explicit `null` differs from a missing field); reject wrong types, conflicting/undefined results and invalid names. Preserve the existing command path, SHA-256, args, forwarded-env and trusted-CWD input. Retain deny-all on failed policy load/reload.
+3. **Profile loader:** Read administrator-controlled `filesystems/*.toml` into a typed mount profile model using the schema in §2. Validate required fields, duplicate/overlapping destinations, RO/RW access, tmpfs sizes, protected destinations, and absolute source/target paths. Profiles contain direct paths; do not introduce a named-resource registry. Resolve the selected profile only when required by Bubblewrap.
+4. **Consistent reload generation:** Publish the compiled Rego policy and validated filesystem profiles together as one immutable generation. On reload, construct and validate the whole generation before swapping it; if compilation/validation fails, use the existing deny-all behavior. An execution retains the generation used for its authorization and profile resolution. Baffle filenames remain references to daemon-managed files, not contents loaded into Gantry.
+5. **Authorized plan:** Split `authorize_command_request` in `src/executor.rs` into reusable authorization and execution steps. Build a typed `AuthorizedInvocation` with the already-resolved absolute executable path, exact args, effective env, authorized CWD path and policy generation; attach a validated profile and optional Baffle filename for Bubblewrap. The backend is **fixed by startup config**, not by Rego. Validate compatibility: Direct requires both fields `null`, Bubblewrap requires a named filesystem profile.
+6. **Side-effect-free checks:** Extend `RunCommandCheckOutput` and `check_command` to report `filesystem`, `baffle_session`, and the configured `backend`, including a useful denial reason for incompatible combinations. `/check` must not start subprocesses, mount anything or create Baffle leases. Preserve the existing public command request schema.
+
+**Tests:** CLI/environment precedence, bind target conflicts, old variables ignored, default backend, Rego result shapes and conflict handling, profile parsing and invalid mounts, backend compatibility matrix, reload atomicity and deny-all, and `/check` with no side effects.
+
+**Phase gate:** All combinations of Rego profiles and the configured backend can be checked and resolved into a validated plan, without launching a sandbox. When splitting work into separate PRs, do not switch the runtime default to Bubblewrap until Phase 2 actually implements it.
+
+### Phase 2 — Direct backend and isolated Bubblewrap execution
+
+**Code locations:** new `src/backend/{mod.rs,direct.rs,bubblewrap.rs}`, `src/execution.rs`, `src/bin/gantry-supervisor.rs`, and integration points in `src/mcp.rs`, `src/raw.rs`, `src/executor.rs`.
+
+1. **Shared execution API:** Introduce `ExecutionBackend::start(plan) -> RunningExecution` (or equivalent) with stdout/stderr handles, exit/wait and explicit cancellation/cleanup. Ensure `run_command_impl` (buffered MCP) and `raw_handler` (NDJSON streaming) use the **same** authorization and backend start path. Refactor `src/raw.rs` away from assuming every running command is directly a `tokio::process::Child`. Preserve stdout/stderr order per stream, output truncation, `start`/`exit` events, nonzero exit status and client-disconnect behavior.
+2. **Direct first:** Extract the existing `spawn_command_process` logic into `DirectBackend`: `Command::new(resolved_path)`, approved args, existing env assembly and trusted CWD handling, inherited network/filesystem view. No supervisor, Baffle provisioning or mounts. Only start it when the server was explicitly launched with `--backend direct` **and** Rego returns both profiles `null`; never use it as a fallback.
+3. **Bubblewrap launcher:** Start a fresh Bubblewrap process for each invocation, with isolated user/mount/PID/network namespaces, private `/proc`, `/tmp` and `/run`, no external network routes, and `--die-with-parent`/session isolation. Construct a restricted runtime baseline that includes the executable path, its interpreter/dynamic linker and required system libraries plus the selected profile's validated mounts. Do **not** use the whole-root `--ro-bind / /` from the Phase 0 smoke tests in production. Do not expose the Gantry/Baffle control sockets or unrelated host paths. Reject missing executable, CWD or runtime dependencies rather than widening the mount view.
+4. **Supervisor handoff:** Build and install a small Rust `gantry-supervisor` binary alongside Gantry, and mount it as trusted runtime content. Pass `AuthorizedInvocation` over a trusted private pipe or equivalent non-caller-controlled channel; never invoke a shell or repeat `PATH` lookup/Rego evaluation. The supervisor launches the resolved absolute executable with the authorized args, CWD and effective env. No sealed executable snapshot, CWD descriptor transfer or TOCTOU hardening beyond the agreed threat model.
+5. **Startup and teardown:** Use an explicit supervisor status/readiness signal so `/raw` sends `start` only after the authorized child actually starts. Distinguish preparation/spawn failures from child nonzero exits. Keep supervision/namespace ownership until descendants have terminated. Ensure cancellation, disconnect, Gantry shutdown and launcher death clean up all descendant processes. With `baffle_session: null`, the supervisor must **not** open a proxy listener.
+6. **Activate the default:** Once Bubblewrap executes correctly, make it the default server backend; on unsupported platforms or namespace-denied containers, report a clear startup/execution error and **do not switch to Direct**. Explicit Direct remains available where appropriate.
+
+**Tests:** Direct backward-compatible execution, all backend-policy rejection cases, sandbox read-only/write/tmpfs behavior, hidden paths/control sockets, direct egress denied, ELF/shebang and CWD handling, stdout/stderr streaming, exit status, errors before `start`, cancellation and descendant cleanup. Run Bubblewrap tests in the target Podman environment, not only on the host.
+
+**Phase gate:** Both backends work through `/mcp`, `/raw`, and `/check`; Bubblewrap executes real commands with profile-enforced filesystem access and **no external network** without Baffle. No Baffle dependency is required for this gate.
+
+### Phase 3 — Per-command Baffle sessions and in-process bridge
+
+**Code locations:** new `src/baffle.rs` (trusted session owner), Bubblewrap backend, and `src/bin/gantry-supervisor.rs`.
+
+1. **Acquire lease in trusted Gantry:** Add the `baffle-client` dependency. Use `Client::new(control_socket).create_from_file(authorized_filename).await` against the daemon's existing **file-only** mode. The filename is the Rego-selected relative Baffle config filename, validated to the daemon's accepted path grammar. Gantry never reads credentials or creates inline policy. Keep the returned `Session` handle outside the sandbox until all descendants finish; dropping/closing it releases the ephemeral lease.
+2. **Expose only the data socket:** For a network-authorized Bubblewrap invocation, bind-mount the resulting live `Session::socket_path()` at a fixed location such as `/run/gantry/proxy.sock` in a private `/run`. Do not expose the containing Baffle directory, another session socket, or the Baffle control UDS. Reject mount/permission failures without changing networking or selecting Direct.
+3. **Bridge inside supervisor:** Use Tokio TCP listener on `127.0.0.1:3128` and a Unix-socket connection to the assigned data socket for each accepted client; use bidirectional byte copying. There is no `socat` dependency in production. Check bridge readiness before spawning the authorized child.
+4. **Proxy environment/trust:** Only for an authorized Baffle session, set controlled `http_proxy`, `https_proxy`, `HTTP_PROXY`, and `HTTPS_PROXY` pointing to the local bridge; prevent user-supplied bypass variables from overriding this routing. Mount the public Baffle CA where required, never its signing key or credential files. Preserve the command's existing no-shell semantics.
+5. **Lease and failure ordering:** Validate command/policy/profile/backend before creating a session; provision the lease, assemble mounts, confirm bridge/child startup, then stream. Clean up child processes and bridge **before releasing** the Baffle lease on normal completion, startup error, timeout/cancellation, disconnect or parent shutdown. Two concurrent invocations must use distinct sockets/leases.
+6. **Direct stays unchanged:** A non-null Baffle filename under `--backend direct` is a validation error; `baffle_session: null` under Direct retains Gantry's ambient networking.
+
+**Tests (performed during implementation, not as more Phase 0 spikes):** Real HTTPS CONNECT through Baffle with permitted and denied destinations/paths; mock and live UDS mount behavior; prove other session/control sockets are absent from the restricted sandbox; run concurrent differently authorized sessions; confirm lease release on success and failure. Use a local controlled HTTPS target or deterministic test fixture where possible rather than relying solely on external services.
+
+**Phase gate:** Commands with selected Baffle profiles can make policy-compliant HTTPS requests, cannot bypass the proxy or access another session, and leave no orphaned Baffle sessions.
+
+### Phase 4 — End-to-end hardening, migration, and release
+
+1. **System tests:** Exercise `/mcp`, `/raw`, `/check`, `run-remote --check`, both listener transports and both backends end-to-end. Verify deny-all on bad policy reload, malformed/unknown profile values, mount errors, unsupported platforms, failed Baffle creation, bridge failure, child errors, client disconnect, parent termination and concurrent execution.
+2. **Isolation tests:** Move the Phase 0 experiments into repeatable integration tests using the *restricted* runtime root. Assert RO/RW semantics, protection of non-mounted paths, no external networking without Baffle, no parent/local proxy or other Baffle socket access, and descendant/process-group cleanup. Include the deferred real-Baffle and session-release checks in automated integration coverage.
+3. **Diagnostics:** Report backend, selected profile, Baffle filename/session identity where safe, namespace setup versus child exit failure, and cleanup outcomes. Never log injected secrets or credential-bearing request content.
+4. **Migration:** Update README, CLI help, filesystem-profile and Rego examples, deployment documentation and environment variable names. Remove legacy `MCP_BIND_ADDR`, `MCP_BIND_UDS` and `POLICY_DIR` server configuration. Document explicit `--backend direct` plus null profiles for existing deployments, and Bubblewrap's new default/host prerequisites. Preserve the current `run-remote` client syntax and environment variables.
+5. **Final verification:** Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the new Podman/Bubblewrap/Baffle integration suite. CI on platforms lacking Bubblewrap must not silently select Direct; use explicit Direct for compatibility-only tests and target Linux integration CI for the sandbox guarantees.
+
+**Release gate:** Every final acceptance criterion below is covered by an automated test or an explicit, reproducible integration-test procedure. Passing the Phase 0 smoke tests alone is not sufficient for release.
+
+## 10. Open decisions
+
+1. **Trusted runtime root:** How should Gantry define and provision the minimum executable, dynamic libraries and system files while avoiding wholesale exposure of the parent root filesystem?
+2. **Filesystem source integrity:** Which descriptor-based Linux APIs and mount strategy will preserve mount-source identity across Bubblewrap setup? Executable byte/inode identity across the authorization-to-spawn interval is explicitly not required.
+3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
+4. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
+5. **Process-tree termination:** Are PID namespaces plus supervisor signalling sufficient for all supported environments, or does Gantry additionally require cgroups or another reaper mechanism?
+6. **Profile configuration and reload:** Finalize direct-path TOML schema, Baffle filename rules, reload consistency, and explicit migration from the legacy boolean policy.
+7. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
+
+## Final acceptance criteria
+
+This feature is complete when:
+
+- The server supports `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend`, with `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR` environment configuration and documented precedence. Legacy unprefixed server variables are not used.
+- Rego returns exactly one validated object with `allow`, `filesystem` and `baffle_session`.
+- Gantry defaults to `--backend bubblewrap` and supports explicit `--backend direct`; Rego never selects the backend. Every command still requires Rego authorization.
+- Bubblewrap has no direct external networking without Baffle; Direct retains Gantry's existing network access and requires `baffle_session: null`.
+- Filesystem profiles specify direct administrator-managed mount source paths; Rego selects Baffle session configuration filenames directly.
+- Bubblewrap enforces the selected filesystem, process and network requirements per invocation.
+- Optional Baffle access provisions a unique ephemeral session per command and keeps its lease until execution cleanup.
+- The Rust supervisor supplies the local HTTP proxy via an in-process TCP-to-UDS bridge on `127.0.0.1:3128`, without `socat`.
+- Concurrent commands have independent proxy and filesystem authority.
+- The supervisor launches the same resolved absolute executable path and invocation authorized by Gantry, without another command-name lookup or policy evaluation. Executable changes after authorization are outside the guarantees. Existing command and check transports preserve their observable output/exit/cancellation contracts, with selected filesystem/Baffle names added to check diagnostics.
+- All setup, isolation, provisioning and cleanup failures fail closed.
+- The decision and profile contracts do not mention Bubblewrap and can be implemented by another enforcing backend.
+
+## References
+
+- [Gantry](https://github.com/dstoc/gantry)
+- [Current Gantry command policy and API](https://github.com/dstoc/gantry/blob/main/README.md)
+- [Gantry CWD authorization guarantees](https://github.com/dstoc/gantry/blob/main/docs/cwd-policy-guarantees.md)
+- [Bubblewrap](https://github.com/containers/bubblewrap)
+- [Baffle](https://github.com/dstoc/baffle)
+- [Baffle control protocol](https://github.com/dstoc/baffle/blob/main/docs/control-protocol.md)
+- [Baffle Rust client](https://github.com/dstoc/baffle/blob/main/docs/client.md)
