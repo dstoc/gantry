@@ -397,6 +397,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Network | Bubblewrap with `baffle_session: null` has no external network; Baffle session rules remain enforced; Direct inherits Gantry networking and requires a null Baffle selection. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
+| Direct | Explicit null filesystem and null Baffle session use existing execution. Verify Direct-disabled and incompatible Baffle decisions are rejected, and Bubblewrap failures do not select Direct. |
 | Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
 
 Include negative tests that deliberately attempt to connect to the parent proxy listener, open other Baffle session sockets, access protected filesystem paths, and use direct TCP egress.
