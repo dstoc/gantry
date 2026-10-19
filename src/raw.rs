@@ -12,15 +12,14 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::execution::ExecutionBackend;
+use crate::execution::{ExecutionBackend, OutputReader, RunningExecution};
 use crate::executor::{
     RunCommandCheckOutput, RunCommandInput, ToolError, check_command_with_backend,
-    spawn_command_process_with_backend,
+    start_command_process_with_backend,
 };
 use crate::policy::PolicyEngine;
 
@@ -103,12 +102,14 @@ pub async fn raw_handler(
     let executable = input.executable.clone();
     let args_for_log = input.args.clone();
 
-    let mut child = match spawn_command_process_with_backend(
+    let mut execution = match start_command_process_with_backend(
         &state.policy_engine,
         &state.default_cwd,
         state.backend,
         input,
-    ) {
+    )
+    .await
+    {
         Ok(child) => child,
         Err(ToolError::Validation(error)) => {
             tracing::warn!(command = %executable, args = ?args_for_log, error = %error, "raw request denied by policy");
@@ -120,10 +121,10 @@ pub async fn raw_handler(
         }
     };
 
-    let stdout = match child.stdout.take() {
+    let stdout = match execution.take_stdout() {
         Some(stdout) => stdout,
         None => {
-            terminate_child(&mut child).await;
+            execution.cancel().await;
             tracing::error!(command = %executable, args = ?args_for_log, "stdout pipe missing");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -131,10 +132,10 @@ pub async fn raw_handler(
             );
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match execution.take_stderr() {
         Some(stderr) => stderr,
         None => {
-            terminate_child(&mut child).await;
+            execution.cancel().await;
             tracing::error!(command = %executable, args = ?args_for_log, "stderr pipe missing");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -147,7 +148,7 @@ pub async fn raw_handler(
 
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(stream_process_events(
-        child,
+        execution,
         stdout,
         stderr,
         tx,
@@ -202,9 +203,9 @@ pub async fn check_handler(
 }
 
 async fn stream_process_events(
-    mut child: Child,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
+    mut execution: RunningExecution,
+    stdout: OutputReader,
+    stderr: OutputReader,
     tx: mpsc::Sender<Bytes>,
     executable: String,
     args: Vec<String>,
@@ -212,7 +213,7 @@ async fn stream_process_events(
     let started = Instant::now();
     if !send_event(&tx, &RawStreamEvent::Start {}).await {
         tracing::info!(command = %executable, args = ?args, "raw client disconnected before start event");
-        terminate_child(&mut child).await;
+        execution.cancel().await;
         return;
     }
 
@@ -238,11 +239,11 @@ async fn stream_process_events(
         tokio::select! {
             _ = tx.closed() => {
                 tracing::info!(command = %executable, args = ?args, "raw client disconnected while waiting for command");
-                terminate_child(&mut child).await;
+                execution.cancel().await;
                 stop_output_readers(&mut reader_tasks).await;
                 return;
             }
-            status = child.wait(), if exit_code.is_none() => {
+            status = execution.wait(), if exit_code.is_none() => {
                 match status {
                     Ok(status) => {
                         exit_code = Some(status.code());
@@ -250,7 +251,7 @@ async fn stream_process_events(
                     Err(error) => {
                         tracing::error!(command = %executable, args = ?args, error = %error, "raw runtime wait failure");
                         let _ = send_event(&tx, &RawStreamEvent::Error { message: format!("Runtime wait failure: {error}") }).await;
-                        terminate_child(&mut child).await;
+                        execution.cancel().await;
                         stop_output_readers(&mut reader_tasks).await;
                         return;
                     }
@@ -266,7 +267,7 @@ async fn stream_process_events(
                         };
                         if !send_event(&tx, &event).await {
                             tracing::info!(command = %executable, args = ?args, "raw client disconnected during stream");
-                            terminate_child(&mut child).await;
+                            execution.cancel().await;
                             stop_output_readers(&mut reader_tasks).await;
                             return;
                         }
@@ -284,7 +285,7 @@ async fn stream_process_events(
                             },
                         )
                         .await;
-                        terminate_child(&mut child).await;
+                        execution.cancel().await;
                         stop_output_readers(&mut reader_tasks).await;
                         return;
                     }
@@ -313,7 +314,7 @@ async fn stream_process_events(
     .await
     {
         tracing::info!(command = %executable, args = ?args, "raw client disconnected before exit event");
-        terminate_child(&mut child).await;
+        execution.cancel().await;
         return;
     }
 
@@ -390,11 +391,6 @@ async fn send_event(tx: &mpsc::Sender<Bytes>, event: &RawStreamEvent) -> bool {
     tx.send(Bytes::from(line)).await.is_ok()
 }
 
-async fn terminate_child(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
 fn error_response(status: StatusCode, message: String) -> Response {
     (status, Json(RawErrorBody { error: message })).into_response()
 }
@@ -406,7 +402,7 @@ mod tests {
 
     use super::*;
     use crate::executor::{MAX_OUTPUT_BYTES, RunCommandCheckOutput, RunCommandInput};
-    use crate::mcp::build_app;
+    use crate::mcp::build_app_with_backend;
     use crate::policy::PolicyEngine;
 
     fn find_executable(name: &str) -> Option<String> {
@@ -435,9 +431,17 @@ mod tests {
     }
 
     async fn start_server(policy_engine: PolicyEngine) -> (String, tokio::task::JoinHandle<()>) {
-        let app = build_app(
+        start_server_with_backend(policy_engine, ExecutionBackend::Direct).await
+    }
+
+    async fn start_server_with_backend(
+        policy_engine: PolicyEngine,
+        backend: ExecutionBackend,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = build_app_with_backend(
             Arc::new(policy_engine),
             std::env::current_dir().expect("current dir"),
+            backend,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -447,6 +451,32 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), server_task)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_policy(root: &std::path::Path, allowed: &[&str]) -> PolicyEngine {
+        let policy_dir = root.join("policies");
+        let filesystem_dir = root.join("filesystems");
+        std::fs::create_dir_all(&policy_dir).expect("policy directory");
+        std::fs::create_dir_all(&filesystem_dir).expect("filesystem directory");
+        let paths = allowed
+            .iter()
+            .map(|path| serde_json::to_string(path).expect("encode path"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            format!(
+                "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\nallowed_paths := {{{paths}}}\ndecision := {{\"allow\": true, \"filesystem\": \"minimal\", \"baffle_session\": null}} if {{\n  allowed_paths[input.path]\n}}\n"
+            ),
+        )
+        .expect("write policy");
+        std::fs::write(
+            filesystem_dir.join("minimal.toml"),
+            "version = 1\nmounts = []\n",
+        )
+        .expect("write filesystem profile");
+        PolicyEngine::from_sources(Some(policy_dir))
     }
 
     async fn decode_events(response: reqwest::Response) -> Vec<RawStreamEvent> {
@@ -541,6 +571,115 @@ mod tests {
             events.last(),
             Some(RawStreamEvent::Exit { exit_code: Some(0) })
         ));
+
+        server_task.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_bubblewrap_streams_after_startup_and_reports_setup_failures_before_start() {
+        if !crate::backend::host_has_required_bubblewrap() {
+            return;
+        }
+        let printf = match find_executable("printf") {
+            Some(path) => path,
+            None => return,
+        };
+        let false_path = match find_executable("false") {
+            Some(path) => path,
+            None => return,
+        };
+        let root = tempfile::tempdir().expect("sandbox policy root");
+        let policy_engine = bubblewrap_policy(root.path(), &[&printf, &false_path]);
+        let (base_url, server_task) =
+            start_server_with_backend(policy_engine, ExecutionBackend::Bubblewrap).await;
+        let client = reqwest::Client::new();
+
+        let check = client
+            .post(format!("{base_url}/check"))
+            .json(&RunCommandInput {
+                executable: printf.clone(),
+                args: vec!["ignored".to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            })
+            .send()
+            .await
+            .expect("check request")
+            .json::<RunCommandCheckOutput>()
+            .await
+            .expect("check response");
+        assert!(check.allowed, "{:?}", check.reason);
+        assert_eq!(check.filesystem.as_deref(), Some("minimal"));
+        assert_eq!(check.backend, "bubblewrap");
+
+        let response = client
+            .post(format!("{base_url}/raw"))
+            .json(&RunCommandInput {
+                executable: printf.clone(),
+                args: vec!["raw-bubblewrap".to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            })
+            .send()
+            .await
+            .expect("raw Bubblewrap request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = decode_events(response).await;
+        assert!(matches!(events.first(), Some(RawStreamEvent::Start {})));
+        assert_eq!(
+            decode_output(&events, OutputStreamKind::Stdout),
+            b"raw-bubblewrap"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RawStreamEvent::Exit { exit_code: Some(0) })
+        ));
+
+        let response = client
+            .post(format!("{base_url}/raw"))
+            .json(&RunCommandInput {
+                executable: false_path,
+                args: vec![],
+                cwd: Some("/".to_string()),
+                env: None,
+            })
+            .send()
+            .await
+            .expect("nonzero Bubblewrap request");
+        let events = decode_events(response).await;
+        assert!(matches!(events.first(), Some(RawStreamEvent::Start {})));
+        assert!(matches!(
+            events.last(),
+            Some(RawStreamEvent::Exit { exit_code: Some(1) })
+        ));
+
+        let response = client
+            .post(format!("{base_url}/raw"))
+            .json(&RunCommandInput {
+                executable: printf,
+                args: vec!["must-not-start".to_string()],
+                cwd: Some(
+                    std::env::current_dir()
+                        .expect("host cwd")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                env: None,
+            })
+            .send()
+            .await
+            .expect("missing sandbox cwd request");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = response
+            .json::<RawErrorBody>()
+            .await
+            .expect("startup error body");
+        assert!(
+            error.error.contains("command startup failed"),
+            "{}",
+            error.error
+        );
 
         server_task.abort();
     }

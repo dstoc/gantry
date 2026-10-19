@@ -7,7 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "gantry [--bind-addr HOST:PORT | --bind-uds ABSOLUTE_PATH] [--policy-dir PATH] [--backend bubblewrap|direct]\n\n+             Phase 1 runtime default: direct. Bubblewrap execution is unavailable until Phase 2."
+            "gantry [--bind-addr HOST:PORT | --bind-uds ABSOLUTE_PATH] [--policy-dir PATH] [--backend bubblewrap|direct]\n\nBubblewrap is the default. Use --backend direct to select unsandboxed execution."
         );
         return Ok(());
     }

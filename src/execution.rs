@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use tokio::io::AsyncRead;
+use tokio::process::Child;
 
 use crate::filesystem::FilesystemProfile;
 use crate::policy::PolicyGeneration;
@@ -78,6 +82,92 @@ impl ExecutionPlan {
             }
         }
         Ok(())
+    }
+}
+
+/// Backend-neutral ownership of a running execution. Backends expose the same
+/// output, wait, and cancellation operations even when the owned process is a
+/// sandbox launcher rather than the authorized command itself.
+pub(crate) struct RunningExecution {
+    child: Child,
+    process_group: Option<i32>,
+    stdout: Option<OutputReader>,
+    stderr: Option<OutputReader>,
+}
+
+pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
+
+impl RunningExecution {
+    pub(crate) fn new(mut child: Child, terminate_process_group: bool) -> Self {
+        let process_group = terminate_process_group
+            .then(|| child.id().map(|pid| pid as i32))
+            .flatten();
+        let stdout = child
+            .stdout
+            .take()
+            .map(|reader| Box::new(reader) as OutputReader);
+        let stderr = child
+            .stderr
+            .take()
+            .map(|reader| Box::new(reader) as OutputReader);
+        Self {
+            child,
+            process_group,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub(crate) fn new_with_streams(
+        child: Child,
+        terminate_process_group: bool,
+        stdout: Option<OutputReader>,
+        stderr: Option<OutputReader>,
+    ) -> Self {
+        let process_group = terminate_process_group
+            .then(|| child.id().map(|pid| pid as i32))
+            .flatten();
+        Self {
+            child,
+            process_group,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<OutputReader> {
+        self.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<OutputReader> {
+        self.stderr.take()
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, io::Error> {
+        let status = self.child.wait().await?;
+        self.terminate_descendants();
+        Ok(status)
+    }
+
+    pub(crate) async fn cancel(&mut self) {
+        self.terminate_descendants();
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+
+    fn terminate_descendants(&self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            unsafe {
+                libc::kill(-(process_group as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl Drop for RunningExecution {
+    fn drop(&mut self) {
+        self.terminate_descendants();
     }
 }
 
