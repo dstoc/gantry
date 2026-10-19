@@ -458,8 +458,8 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 This feature is complete when:
 
 - Rego returns exactly one validated object with `allow`, `filesystem` and `baffle_session`.
-- Every authorized command requires a named filesystem profile and always runs in an isolated sandbox.
-- Network access is absent by default and never falls back to direct egress.
+- A named filesystem profile selects Bubblewrap; `filesystem: null` selects Direct only when enabled. Every allowed command still requires Rego authorization.
+- Bubblewrap has no direct external networking without Baffle; Direct retains Gantry's existing network access and requires `baffle_session: null`.
 - Filesystem profiles specify direct administrator-managed mount source paths; Rego selects Baffle session configuration filenames directly.
 - Bubblewrap enforces the selected filesystem, process and network requirements per invocation.
 - Optional Baffle access provisions a unique ephemeral session per command and keeps its lease until execution cleanup.
