@@ -274,7 +274,7 @@ trait ExecutionBackend {
 
 `RunningExecution` supports streamed output, exit status, cancellation and cleanup. Exact Rust type and ownership details are implementation decisions; the important property is **no orphaned process tree or leaked Baffle lease** when the caller disconnects or execution fails.
 
-The backend is selected through trusted Gantry configuration, **not Rego**. Initially `bubblewrap` is the only isolating backend. Future OCI/container or microVM backends can translate the same filesystem and process requirements into their mechanisms, using the same Baffle session selection; they must reject unsupported requirements rather than silently degrade isolation. Any temporary direct-execution backend used solely for tests must never be an implicit production fallback.
+The filesystem decision selects the backend: a named filesystem profile selects Bubblewrap, while `filesystem: null` selects Direct when enabled by trusted Gantry configuration. Direct keeps the current `tokio::process::Command` behavior. Future backends may implement named profiles, but failed Bubblewrap execution never falls back to Direct.
 
 Use capability validation before provisioning. Concurrent runs must each retain their own immutable policy/profile snapshot and execution ownership.
 
