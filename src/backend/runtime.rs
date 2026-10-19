@@ -82,7 +82,14 @@ pub(super) fn runtime_files(
                     ));
                 }
             } else {
-                resolve_library(&needed, &search_dirs, &cache, &default_library_dirs).ok_or_else(|| {
+                resolve_library(
+                    &needed,
+                    &search_dirs,
+                    &cache,
+                    &default_library_dirs,
+                    profile,
+                )
+                .ok_or_else(|| {
                     format!(
                         "ELF dependency '{needed}' for '{}' is unavailable in the trusted runtime or selected environment",
                         path.display()
@@ -482,10 +489,14 @@ fn resolve_library(
     search_dirs: &[PathBuf],
     cache: &BTreeMap<String, Vec<PathBuf>>,
     trusted_dirs: &[PathBuf],
+    profile: &FilesystemProfile,
 ) -> Option<PathBuf> {
     for directory in search_dirs {
         let candidate = directory.join(name);
-        if candidate.is_file() && trusted_library_path(&candidate, trusted_dirs) {
+        if candidate.is_file()
+            && (trusted_library_path(&candidate, trusted_dirs)
+                || profile_exposes_path(profile, &candidate))
+        {
             return Some(candidate);
         }
     }

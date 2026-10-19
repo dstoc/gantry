@@ -891,6 +891,50 @@ mod tests {
         }
     }
 
+    fn compile_rpath_test_command(directory: &Path) -> PathBuf {
+        std::fs::create_dir_all(directory).expect("custom library directory");
+        let library_source = directory.join("libreview.c");
+        let command_source = directory.join("command.c");
+        let library = directory.join("libreview.so");
+        let command = directory.join("command");
+        std::fs::write(&library_source, "int answer(void) { return 42; }\n")
+            .expect("write custom library source");
+        std::fs::write(
+            &command_source,
+            "int answer(void); int main(void) { return answer() == 42 ? 0 : 1; }\n",
+        )
+        .expect("write custom command source");
+
+        let output = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&library_source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .expect("start C compiler for custom shared library");
+        assert!(
+            output.status.success(),
+            "custom library compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = std::process::Command::new("cc")
+            .arg(&command_source)
+            .arg(format!("-L{}", directory.display()))
+            .arg("-lreview")
+            .arg(format!("-Wl,-rpath,{}", directory.display()))
+            .arg("-o")
+            .arg(&command)
+            .output()
+            .expect("start C compiler for custom command");
+        assert!(
+            output.status.success(),
+            "custom command compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        command
+    }
+
     #[test]
     fn backend_compatibility_matrix_is_reported_by_check_without_execution() {
         let true_path = find_executable("true").expect("true executable");
@@ -1220,6 +1264,140 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         .await
         .expect_err("unmounted authorized cwd must prevent execution");
         assert!(matches!(error, ToolError::BackendSetup { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn buffered_execution_preserves_signal_termination_and_exit_128() {
+        let shell = match find_executable("sh") {
+            Some(path) => path,
+            None => return,
+        };
+        let cwd = default_cwd_for_tests();
+        let direct_engine = rego_engine_allow_commands(&[&shell]);
+        let invoke = |script: &str| RunCommandInput {
+            executable: shell.clone(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: Some("/".to_string()),
+            env: None,
+        };
+
+        let output = run_command_with_backend(
+            &direct_engine,
+            &cwd,
+            ExecutionBackend::Direct,
+            invoke("kill -TERM $$"),
+        )
+        .await
+        .expect("Direct signal execution");
+        assert_eq!(output.exit_code, None);
+
+        let output = run_command_with_backend(
+            &direct_engine,
+            &cwd,
+            ExecutionBackend::Direct,
+            invoke("exit 128"),
+        )
+        .await
+        .expect("Direct exit 128 execution");
+        assert_eq!(output.exit_code, Some(128));
+
+        if !bubblewrap_capable() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("Bubblewrap policy root");
+        let bubblewrap_engine = policy_engine_with_selection(root.path(), Some("minimal"), None);
+        let output = run_command_with_backend(
+            &bubblewrap_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            invoke("kill -TERM $$"),
+        )
+        .await
+        .expect("Bubblewrap signal execution");
+        assert_eq!(output.exit_code, None);
+
+        let output = run_command_with_backend(
+            &bubblewrap_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            invoke("exit 128"),
+        )
+        .await
+        .expect("Bubblewrap exit 128 execution");
+        assert_eq!(output.exit_code, Some(128));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_uses_custom_rpath_libraries_only_when_the_profile_mounts_them() {
+        if !bubblewrap_capable() {
+            return;
+        }
+        let cwd = default_cwd_for_tests();
+        let root = tempfile::tempdir_in(&cwd).expect("test root");
+        let custom_dir = root.path().join("custom");
+        let command = compile_rpath_test_command(&custom_dir);
+        assert!(
+            std::process::Command::new(&command)
+                .status()
+                .expect("run custom command on host")
+                .success(),
+            "custom RPATH command did not run on the host"
+        );
+
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        std::fs::create_dir_all(&policy_dir).expect("policy directory");
+        std::fs::create_dir_all(&filesystem_dir).expect("filesystem directory");
+        std::fs::write(
+            filesystem_dir.join("custom.toml"),
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
+                custom_dir.to_string_lossy(),
+                custom_dir.to_string_lossy(),
+            ),
+        )
+        .expect("write custom profile");
+        std::fs::write(
+            filesystem_dir.join("minimal.toml"),
+            "version = 1\nmounts = []\n",
+        )
+        .expect("write minimal profile");
+
+        for profile in ["custom", "minimal"] {
+            std::fs::write(
+                policy_dir.join("main.rego"),
+                format!(
+                    "package sandbox.main\n\ndecision := {{\"allow\": true, \"filesystem\": {}, \"baffle_session\": null}}\n",
+                    serde_json::to_string(profile).expect("encode filesystem profile")
+                ),
+            )
+            .expect("update policy");
+            let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+            let result = run_command_with_backend(
+                &engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                RunCommandInput {
+                    executable: command.to_string_lossy().into_owned(),
+                    args: vec![],
+                    cwd: Some("/".to_string()),
+                    env: None,
+                },
+            )
+            .await;
+            if profile == "custom" {
+                let output = result.expect("mounted custom RPATH library is available");
+                assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+            } else {
+                let error = result.expect_err("unmounted custom RPATH library must be rejected");
+                assert!(
+                    matches!(error, ToolError::BackendSetup { ref details } if details.contains("libreview.so")),
+                    "unexpected missing-library error: {error}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -488,6 +488,27 @@ mod tests {
             .collect()
     }
 
+    async fn request_exit_code(base_url: &str, executable: &str, script: &str) -> Option<i32> {
+        let response = reqwest::Client::new()
+            .post(format!("{base_url}/raw"))
+            .json(&RunCommandInput {
+                executable: executable.to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            })
+            .send()
+            .await
+            .expect("raw request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = decode_events(response).await;
+        assert!(matches!(events.first(), Some(RawStreamEvent::Start {})));
+        match events.last() {
+            Some(RawStreamEvent::Exit { exit_code }) => *exit_code,
+            event => panic!("raw response did not end with an exit event: {event:?}"),
+        }
+    }
+
     fn decode_output(events: &[RawStreamEvent], stream: OutputStreamKind) -> Vec<u8> {
         let mut bytes = Vec::new();
         for event in events {
@@ -573,6 +594,45 @@ mod tests {
         ));
 
         server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_reports_signal_termination_distinct_from_exit_128() {
+        let shell = match find_executable("sh") {
+            Some(path) => path,
+            None => return,
+        };
+        let (base_url, server_task) = start_server(rego_engine_allow_commands(&[&shell])).await;
+        assert_eq!(
+            request_exit_code(&base_url, &shell, "kill -TERM $$").await,
+            None
+        );
+        assert_eq!(
+            request_exit_code(&base_url, &shell, "exit 128").await,
+            Some(128)
+        );
+        server_task.abort();
+
+        #[cfg(target_os = "linux")]
+        {
+            if !crate::backend::host_has_required_bubblewrap() {
+                return;
+            }
+            let root = tempfile::tempdir().expect("sandbox policy root");
+            let policy_engine = bubblewrap_policy(root.path(), &[&shell]);
+            let (base_url, server_task) =
+                start_server_with_backend(policy_engine, ExecutionBackend::Bubblewrap).await;
+            assert_eq!(
+                request_exit_code(&base_url, &shell, "kill -TERM $$").await,
+                None
+            );
+            assert_eq!(
+                request_exit_code(&base_url, &shell, "exit 128").await,
+                Some(128)
+            );
+            server_task.abort();
+        }
     }
 
     #[cfg(target_os = "linux")]

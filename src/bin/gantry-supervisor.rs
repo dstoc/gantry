@@ -3,9 +3,26 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum EncodedSupervisorMessage {
+    Started,
+    SetupError {
+        error: String,
+    },
+    Stdout {
+        data: String,
+    },
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,13 +31,6 @@ struct AuthorizedInvocation {
     args: Vec<String>,
     cwd: PathBuf,
     environment: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SupervisorStatus<'a> {
-    status: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
 }
 
 #[tokio::main]
@@ -37,13 +47,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let invocation: AuthorizedInvocation = match serde_json::from_slice(&input) {
         Ok(invocation) => invocation,
         Err(error) => {
-            write_status("setup_error", Some(&error.to_string()))?;
+            write_status(EncodedSupervisorMessage::SetupError {
+                error: error.to_string(),
+            })?;
             return Err(error.into());
         }
     };
     if !invocation.executable.is_absolute() || !invocation.cwd.is_absolute() {
         let message = "authorized executable and cwd must be absolute paths";
-        write_status("setup_error", Some(message))?;
+        write_status(EncodedSupervisorMessage::SetupError {
+            error: message.to_string(),
+        })?;
         return Err(message.into());
     }
 
@@ -63,12 +77,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            write_status("setup_error", Some(&error.to_string()))?;
+            write_status(EncodedSupervisorMessage::SetupError {
+                error: error.to_string(),
+            })?;
             return Err(error.into());
         }
     };
     let pid = child.id().ok_or("authorized command has no process id")? as i32;
-    write_status("started", None)?;
+    write_status(EncodedSupervisorMessage::Started)?;
 
     let stdout = child
         .stdout
@@ -79,11 +95,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .take()
         .ok_or("authorized stderr pipe missing")?;
     let stdout_task = tokio::spawn(async move {
-        tokio::io::copy(
-            &mut tokio::io::BufReader::new(stdout),
-            &mut tokio::io::stdout(),
-        )
-        .await
+        let mut reader = BufReader::new(stdout);
+        let mut writer = tokio::io::stdout();
+        let mut buffer = [0; 8192];
+        loop {
+            let bytes_read = reader.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&buffer[..bytes_read]);
+            write_message(&mut writer, EncodedSupervisorMessage::Stdout { data }).await?;
+        }
+        Ok::<_, std::io::Error>(())
     });
     let stderr_task = tokio::spawn(async move {
         tokio::io::copy(
@@ -100,16 +123,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     stdout_result?;
     stderr_result?;
 
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    let command_status = if let Some(code) = status.code() {
+        (Some(code), None)
+    } else {
+        #[cfg(unix)]
+        {
+            (None, status.signal())
+        }
+        #[cfg(not(unix))]
+        {
+            (None, None)
+        }
+    };
+    write_status(EncodedSupervisorMessage::Exited {
+        code: command_status.0,
+        signal: command_status.1,
+    })?;
+
     std::process::exit(status.code().unwrap_or(128));
 }
 
-fn write_status(status: &str, error: Option<&str>) -> std::io::Result<()> {
-    let message = serde_json::to_vec(&SupervisorStatus { status, error })?;
+fn write_status(status: EncodedSupervisorMessage) -> std::io::Result<()> {
+    let message = serde_json::to_vec(&status)?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     output.write_all(&message)?;
     output.write_all(b"\n")?;
     output.flush()
+}
+
+async fn write_message<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    message: EncodedSupervisorMessage,
+) -> std::io::Result<()> {
+    let message = serde_json::to_vec(&message)?;
+    output.write_all(&message).await?;
+    output.write_all(b"\n").await?;
+    output.flush().await
 }
 
 fn terminate_sandbox_descendants(command_pid: i32) {

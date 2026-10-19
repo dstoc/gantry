@@ -9,11 +9,15 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
 
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use base64::Engine as _;
+    use tokio::io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    };
     use tokio::process::Command;
+    use tokio::sync::oneshot;
 
     use crate::backend::{StartError, runtime::runtime_files};
-    use crate::execution::{ExecutionPlan, RunningExecution};
+    use crate::execution::{ExecutionExitStatus, ExecutionPlan, RunningExecution};
     use crate::filesystem::{FilesystemMount, MountAccess};
 
     const SUPERVISOR_TARGET: &str = "/run/gantry-supervisor";
@@ -28,11 +32,19 @@ mod linux {
     }
 
     #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct SupervisorStatus {
-        status: String,
-        #[serde(default)]
-        error: Option<String>,
+    #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+    enum SupervisorMessage {
+        Started,
+        SetupError {
+            error: String,
+        },
+        Stdout {
+            data: String,
+        },
+        Exited {
+            code: Option<i32>,
+            signal: Option<i32>,
+        },
     }
 
     #[derive(Debug, Clone)]
@@ -211,7 +223,7 @@ mod linux {
                     "Bubblewrap exited before the authorized command started{diagnostics}"
                 )));
             }
-            Ok(_) => match serde_json::from_str::<SupervisorStatus>(&line) {
+            Ok(_) => match serde_json::from_str::<SupervisorMessage>(&line) {
                 Ok(status) => status,
                 Err(error) => {
                     terminate_launcher(&mut child).await;
@@ -227,14 +239,20 @@ mod linux {
                 )));
             }
         };
-        if status.status != "started" {
-            terminate_launcher(&mut child).await;
-            return Err(StartError::Setup(format!(
-                "Bubblewrap command startup failed: {}",
-                status
-                    .error
-                    .unwrap_or_else(|| "unspecified supervisor error".to_string())
-            )));
+        match status {
+            SupervisorMessage::Started => {}
+            SupervisorMessage::SetupError { error } => {
+                terminate_launcher(&mut child).await;
+                return Err(StartError::Setup(format!(
+                    "Bubblewrap command startup failed: {error}"
+                )));
+            }
+            _ => {
+                terminate_launcher(&mut child).await;
+                return Err(StartError::Setup(
+                    "Bubblewrap supervisor returned an unexpected startup status".to_string(),
+                ));
+            }
         }
 
         tracing::debug!(
@@ -244,7 +262,13 @@ mod linux {
             cwd = %plan.invocation.cwd.display(),
             "Bubblewrap supervisor started authorized invocation",
         );
-        let stdout: crate::execution::OutputReader = Box::new(status_reader);
+        let (stdout_reader, stdout_writer) = tokio::io::duplex(16 * 1024);
+        let (final_status_tx, final_status_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = forward_supervisor_output(status_reader, stdout_writer).await;
+            let _ = final_status_tx.send(result);
+        });
+        let stdout: crate::execution::OutputReader = Box::new(stdout_reader);
         let stderr = child
             .stderr
             .take()
@@ -254,7 +278,55 @@ mod linux {
             true,
             Some(stdout),
             stderr,
+            final_status_rx,
         ))
+    }
+
+    async fn forward_supervisor_output<R, W>(
+        mut reader: R,
+        mut stdout: W,
+    ) -> Result<ExecutionExitStatus, io::Error>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Bubblewrap supervisor exited without command status",
+                ));
+            }
+            match serde_json::from_str::<SupervisorMessage>(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid Bubblewrap supervisor message: {error}"),
+                )
+            })? {
+                SupervisorMessage::Stdout { data } => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid encoded supervisor output: {error}"),
+                            )
+                        })?;
+                    stdout.write_all(&bytes).await?;
+                }
+                SupervisorMessage::Exited { code, signal } => {
+                    return ExecutionExitStatus::from_components(code, signal);
+                }
+                SupervisorMessage::Started | SupervisorMessage::SetupError { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected Bubblewrap supervisor status after command startup",
+                    ));
+                }
+            }
+        }
     }
 
     fn build_bubblewrap_args(

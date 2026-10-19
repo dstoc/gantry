@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncRead;
 use tokio::process::Child;
+use tokio::sync::oneshot;
 
 use crate::filesystem::FilesystemProfile;
 use crate::policy::PolicyGeneration;
@@ -93,9 +94,61 @@ pub(crate) struct RunningExecution {
     process_group: Option<i32>,
     stdout: Option<OutputReader>,
     stderr: Option<OutputReader>,
+    final_status: Option<FinalStatusReceiver>,
+    completed_status: Option<ExecutionExitStatus>,
 }
 
 pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionExitStatus {
+    code: Option<i32>,
+    signal: Option<i32>,
+}
+
+impl ExecutionExitStatus {
+    pub(crate) fn from_process(status: std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Self {
+                code: status.code(),
+                signal: status.signal(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                code: status.code(),
+                signal: None,
+            }
+        }
+    }
+
+    pub(crate) fn from_components(
+        code: Option<i32>,
+        signal: Option<i32>,
+    ) -> Result<Self, io::Error> {
+        if code.is_some() == signal.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution status must contain exactly one exit code or signal",
+            ));
+        }
+        Ok(Self { code, signal })
+    }
+
+    pub(crate) fn code(self) -> Option<i32> {
+        self.code
+    }
+
+    #[cfg(test)]
+    fn signal(self) -> Option<i32> {
+        self.signal
+    }
+}
+
+type FinalStatusReceiver = oneshot::Receiver<Result<ExecutionExitStatus, io::Error>>;
 
 impl RunningExecution {
     pub(crate) fn new(mut child: Child, terminate_process_group: bool) -> Self {
@@ -115,6 +168,8 @@ impl RunningExecution {
             process_group,
             stdout,
             stderr,
+            final_status: None,
+            completed_status: None,
         }
     }
 
@@ -123,6 +178,7 @@ impl RunningExecution {
         terminate_process_group: bool,
         stdout: Option<OutputReader>,
         stderr: Option<OutputReader>,
+        final_status: FinalStatusReceiver,
     ) -> Self {
         let process_group = terminate_process_group
             .then(|| child.id().map(|pid| pid as i32))
@@ -132,6 +188,8 @@ impl RunningExecution {
             process_group,
             stdout,
             stderr,
+            final_status: Some(final_status),
+            completed_status: None,
         }
     }
 
@@ -143,9 +201,25 @@ impl RunningExecution {
         self.stderr.take()
     }
 
-    pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, io::Error> {
+    pub(crate) async fn wait(&mut self) -> Result<ExecutionExitStatus, io::Error> {
+        if let Some(status) = self.completed_status {
+            return Ok(status);
+        }
         let status = self.child.wait().await?;
         self.terminate_descendants();
+        let status = if let Some(receiver) = self.final_status.as_mut() {
+            let status = (&mut *receiver).await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "execution backend exited without reporting command status",
+                )
+            })??;
+            self.final_status = None;
+            status
+        } else {
+            ExecutionExitStatus::from_process(status)
+        };
+        self.completed_status = Some(status);
         Ok(status)
     }
 
@@ -174,6 +248,25 @@ impl Drop for RunningExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_status_keeps_signal_distinct_from_exit_code() {
+        let signaled =
+            ExecutionExitStatus::from_components(None, Some(libc::SIGTERM)).expect("signal status");
+        let exited = ExecutionExitStatus::from_components(Some(128), None).expect("exit status");
+
+        assert_eq!(signaled.code(), None);
+        assert_eq!(signaled.signal(), Some(libc::SIGTERM));
+        assert_eq!(exited.code(), Some(128));
+        assert_eq!(exited.signal(), None);
+    }
+
+    #[test]
+    fn rejects_ambiguous_execution_status() {
+        assert!(ExecutionExitStatus::from_components(None, None).is_err());
+        assert!(ExecutionExitStatus::from_components(Some(128), Some(15)).is_err());
+    }
 
     #[test]
     fn parses_only_configured_backend_names() {

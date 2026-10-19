@@ -31,6 +31,6 @@ jobs:
             docker.io/library/rust:1-bookworm \
             sh -euc '
               apt-get update
-              apt-get install --yes bubblewrap curl
+              apt-get install --yes bubblewrap curl gcc
               GANTRY_REQUIRE_BUBBLEWRAP_TESTS=1 cargo test --locked
             '
