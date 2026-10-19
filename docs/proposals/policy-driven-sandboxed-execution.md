@@ -411,7 +411,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 - Extend check responses to include policy fields and the startup-configured backend while retaining current fields and exit conventions.
 - Preserve existing MCP command output and `/raw` stdout/stderr streaming, output limits, exit codes and disconnect semantics.
 - Refactor synchronous `spawn_command_process` and the shared authorization path as needed because Baffle provisioning and backend startup are asynchronous. Keep authorization shared between all execution paths.
-- Document migration from `data.sandbox.main.allow` to structured decisions; Direct deployments explicitly use `--backend direct` and both-null policy fields. Missing fields never imply Direct.
+- Document migration from `data.sandbox.main.allow` to structured decisions; Direct deployments explicitly use `--backend direct` and both-null policy fields. Missing fields never imply Direct. Rename the legacy server variables to `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR` without retaining aliases.
 - Retain deny-all behaviour on policy startup/reload errors. Load Rego and direct-path filesystem profiles into coherent immutable generations; validate Baffle filenames against the configured session directory before provisioning; do not combine values from incompatible reload generations.
 
 ## 7. Security acceptance requirements
@@ -438,6 +438,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
 | Backend selection | Without a flag, Bubblewrap is selected; `--backend direct` runs existing execution only for both-null policy fields. Verify incompatible combinations fail and Bubblewrap errors never trigger Direct. |
+| Server configuration | CLI-over-environment precedence; TCP/UDS exclusivity; default TCP bind; UDS path validation; missing/invalid policy directory deny-all; unprefixed legacy variables ignored; client `RUN_REMOTE_*` unaffected. |
 | Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
 
 Include negative tests that deliberately attempt to connect to the parent proxy listener, open other Baffle session sockets, access protected filesystem paths, and use direct TCP egress.
@@ -468,6 +469,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 - Introduce `ExecutionBackend` and `RunningExecution` lifecycle types.
 - Implement Direct by retaining Gantry's current process spawn and lifecycle; select it only with `--backend direct`, with `bubblewrap` as the default.
+- Add `--bind-addr`, `--bind-uds`, and `--policy-dir` with the documented `GANTRY_` environment fallbacks and validation; remove recognition of old server variable names.
 - Implement isolated per-command Bubblewrap execution without external networking.
 - Implement simple authorized-invocation handoff to the supervisor without a new executable lookup; use the authorized CWD path and preserve output and cancellation semantics.
 - Add filesystem and namespace escape tests.
@@ -507,6 +509,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 This feature is complete when:
 
+- The server supports `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend`, with `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR` environment configuration and documented precedence. Legacy unprefixed server variables are not used.
 - Rego returns exactly one validated object with `allow`, `filesystem` and `baffle_session`.
 - Gantry defaults to `--backend bubblewrap` and supports explicit `--backend direct`; Rego never selects the backend. Every command still requires Rego authorization.
 - Bubblewrap has no direct external networking without Baffle; Direct retains Gantry's existing network access and requires `baffle_session: null`.
