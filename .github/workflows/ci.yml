@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo build --locked
+        run: cargo build --locked --bins
       - name: Test
         run: cargo test --locked
       - name: Test in Podman
@@ -31,6 +31,12 @@ jobs:
             docker.io/library/rust:1-bookworm \
             sh -euc '
               apt-get update
-              apt-get install --yes bubblewrap curl gcc
+              apt-get install --yes bubblewrap curl gcc cmake clang libclang-dev pkg-config git
+              git clone --no-checkout https://github.com/dstoc/baffle.git /tmp/baffle
+              git -C /tmp/baffle checkout c99af79a51089555896648dd3307b96fecd1d0db
+              cd /tmp/baffle
+              RUSTFLAGS="--cfg baffle_integration_test" cargo build --locked --bin baffle
+              cd /workspace
+              GANTRY_BAFFLE_TEST_BINARY=/tmp/baffle/target/debug/baffle \
               GANTRY_REQUIRE_BUBBLEWRAP_TESTS=1 cargo test --locked
             '

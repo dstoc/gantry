@@ -96,6 +96,7 @@ pub(crate) struct RunningExecution {
     stderr: Option<OutputReader>,
     final_status: Option<FinalStatusReceiver>,
     completed_status: Option<ExecutionExitStatus>,
+    baffle_lease: Option<crate::baffle::BaffleSessionLease>,
 }
 
 pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -170,6 +171,7 @@ impl RunningExecution {
             stderr,
             final_status: None,
             completed_status: None,
+            baffle_lease: None,
         }
     }
 
@@ -190,7 +192,22 @@ impl RunningExecution {
             stderr,
             final_status: Some(final_status),
             completed_status: None,
+            baffle_lease: None,
         }
+    }
+
+    pub(crate) fn new_with_streams_and_baffle_lease(
+        child: Child,
+        terminate_process_group: bool,
+        stdout: Option<OutputReader>,
+        stderr: Option<OutputReader>,
+        final_status: FinalStatusReceiver,
+        baffle_lease: crate::baffle::BaffleSessionLease,
+    ) -> Self {
+        let mut execution =
+            Self::new_with_streams(child, terminate_process_group, stdout, stderr, final_status);
+        execution.baffle_lease = Some(baffle_lease);
+        execution
     }
 
     pub(crate) fn take_stdout(&mut self) -> Option<OutputReader> {
@@ -220,6 +237,7 @@ impl RunningExecution {
             ExecutionExitStatus::from_process(status)
         };
         self.completed_status = Some(status);
+        self.baffle_lease.take();
         Ok(status)
     }
 
@@ -227,6 +245,7 @@ impl RunningExecution {
         self.terminate_descendants();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+        self.baffle_lease.take();
     }
 
     fn terminate_descendants(&self) {
@@ -242,6 +261,36 @@ impl RunningExecution {
 impl Drop for RunningExecution {
     fn drop(&mut self) {
         self.terminate_descendants();
+        let Some(lease) = self.baffle_lease.take() else {
+            return;
+        };
+        let pid = self.child.id();
+        let _ = self.child.start_kill();
+
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            std::thread::spawn(move || {
+                let mut status = 0;
+                loop {
+                    let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                    if result == pid as libc::pid_t
+                        || result < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+                    {
+                        break;
+                    }
+                    if result < 0
+                        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break;
+                    }
+                }
+                drop(lease);
+            });
+            return;
+        }
+
+        drop(lease);
     }
 }
 

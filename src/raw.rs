@@ -16,10 +16,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::{ExecutionBackend, OutputReader, RunningExecution};
 use crate::executor::{
     RunCommandCheckOutput, RunCommandInput, ToolError, check_command_with_backend,
-    start_command_process_with_backend,
+    start_command_process_with_baffle_config,
 };
 use crate::policy::PolicyEngine;
 
@@ -28,6 +29,7 @@ pub struct RawEndpointState {
     pub policy_engine: Arc<PolicyEngine>,
     pub default_cwd: PathBuf,
     pub backend: ExecutionBackend,
+    pub baffle: BaffleRuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,10 +104,11 @@ pub async fn raw_handler(
     let executable = input.executable.clone();
     let args_for_log = input.args.clone();
 
-    let mut execution = match start_command_process_with_backend(
+    let mut execution = match start_command_process_with_baffle_config(
         &state.policy_engine,
         &state.default_cwd,
         state.backend,
+        state.baffle.clone(),
         input,
     )
     .await
