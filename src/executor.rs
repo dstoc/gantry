@@ -1201,6 +1201,10 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
     async fn bubblewrap_setup_failure_never_falls_back_to_direct() {
         let true_path = find_executable("true").expect("true executable");
         let root = tempfile::tempdir().expect("profile root");
+        // The Bubblewrap backend always replaces /tmp with a private tmpfs.
+        // Use a host directory there so the authorized CWD is guaranteed to
+        // be absent inside the sandbox, including when CI itself runs in /workspace.
+        let hidden_cwd = tempfile::tempdir_in("/tmp").expect("hidden cwd");
         let engine = policy_engine_with_selection(root.path(), Some("workspace"), None);
         let error = run_command_with_backend(
             &engine,
@@ -1209,7 +1213,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             RunCommandInput {
                 executable: true_path,
                 args: vec![],
-                cwd: None,
+                cwd: Some(hidden_cwd.path().to_string_lossy().into_owned()),
                 env: None,
             },
         )
