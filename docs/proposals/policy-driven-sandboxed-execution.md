@@ -79,6 +79,36 @@ Command exit -> output/status and backend-specific cleanup
 
 **Boundary:** The startup CLI flag selects the backend independently of Rego. Rego specifies required filesystem and Baffle access; Gantry checks compatibility before execution. Direct requires both fields to be `null`, while Bubblewrap requires a named filesystem profile. Command callers and policies cannot change the configured backend, and Bubblewrap failures never downgrade to Direct.
 
+## Server command-line and environment configuration
+
+Gantry's server accepts command-line flags for its listener, policy directory, and execution backend. The server configuration is separate from the `run-remote` client interface.
+
+| Command-line option | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `--bind-addr <HOST:PORT>` | `GANTRY_BIND_ADDR` | `127.0.0.1:8000` when no UDS is selected | Listen over TCP for `/mcp`, `/raw`, and `/check`. |
+| `--bind-uds <ABSOLUTE_PATH>` | `GANTRY_BIND_UDS` | Unset | Listen for the same endpoints on a Unix domain socket instead of TCP. |
+| `--policy-dir <PATH>` | `GANTRY_POLICY_DIR` | Unset (deny-all) | Root directory containing Rego policy files. |
+| `--backend <bubblewrap|direct>` | None | `bubblewrap` | Select one execution backend for the server instance; Direct requires explicit CLI selection. |
+
+**Precedence and validation:**
+
+- Explicit command-line configuration takes precedence over environment configuration. When either listener flag is supplied, it selects the listener type and overrides **both** listener environment variables; supplying both `--bind-addr` and `--bind-uds` is an error.
+- Without a listener flag, `GANTRY_BIND_ADDR` and `GANTRY_BIND_UDS` are mutually exclusive if both are set to nonempty values. If neither is supplied, bind `127.0.0.1:8000`.
+- `--policy-dir` overrides `GANTRY_POLICY_DIR`. An unset policy directory retains Gantry's fail-closed deny-all behavior; invalid policy loading also remains deny-all.
+- Validate the TCP address, require an absolute UDS path with an existing parent directory, and reject malformed CLI values and unknown flags. Continue the existing UDS socket-file handling.
+- `--backend` is CLI-only and defaults to Bubblewrap; there is no `GANTRY_BACKEND` variable or separate Direct-enable setting in this proposal.
+- Rename the existing server environment variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` to `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`. The old names are **not** aliases or fallbacks after migration. Document this breaking configuration change for deployments.
+- These are server settings; the `run-remote` client's `RUN_REMOTE_SERVER` and `RUN_REMOTE_SOCKET` are unchanged.
+
+Example:
+
+```sh
+gantry --bind-addr 127.0.0.1:8000 --policy-dir /etc/gantry/policies
+gantry --bind-uds /run/gantry/gantry.sock --policy-dir /etc/gantry/policies
+GANTRY_POLICY_DIR=/etc/gantry/policies GANTRY_BIND_UDS=/run/gantry/gantry.sock gantry
+gantry --backend direct --policy-dir /etc/gantry/direct-policies
+```
+
 ## 1. Rego decision contract
 
 ### Single structured decision
