@@ -12,7 +12,7 @@ Evolve Gantry from a policy-enforced command runner into a **policy-driven, per-
 - A named **filesystem profile** containing explicit administrator-defined mount source paths and permissions.
 - An optional **Baffle session configuration filename**, which controls network access.
 
-Gantry resolves the decision into a backend-neutral execution plan. An execution backend enforces the plan; **Bubblewrap (`bwrap`) is the initial backend**, but is not exposed in Rego. For a selected Baffle file Gantry creates a fresh, leased session per command. A small Rust **`gantry-supervisor`** inside the command's network namespace provides a localhost TCP-to-Unix-socket bridge without `socat`, and launches a **pinned executable snapshot** rather than re-resolving the requested executable.
+Gantry resolves the decision into a backend-neutral execution plan. An execution backend enforces the plan; **Bubblewrap (`bwrap`) is the initial backend**, but is not exposed in Rego. For a selected Baffle file Gantry creates a fresh, leased session per command. A small Rust **`gantry-supervisor`** inside the command's network namespace provides a localhost TCP-to-Unix-socket bridge without `socat`, and launches the **absolute executable path already resolved and authorized by Gantry**, with no additional policy evaluation or `PATH` lookup.
 
 Every command runs with a new isolation boundary, including commands for which Rego selects no network access. Authorization and sandbox establishment are fail-closed. Existing MCP, raw streaming, and check interfaces remain the command-facing entry points.
 
@@ -60,7 +60,7 @@ Execution planner
   - Resolve filesystem policy to validated direct mount paths
   - Validate selected Baffle configuration filename
   - Validate backend capabilities
-  - Pin authorized executable bytes + opened cwd
+  - Carry forward the authorized executable path, args, env + opened cwd
   - Create optional leased Baffle session
          |
          v
@@ -205,7 +205,7 @@ A selected profile adds only its declared direct-path mounts to that baseline. I
 
 - Ensure authorized mount sources correspond to the objects actually mounted, avoiding re-resolution through mutable paths.
 - Preserve the existing fd-resolved CWD guarantee from `docs/cwd-policy-guarantees.md`: map the authorized directory object safely inside the namespace and use its corresponding sandbox path. Do **not** leak a parent-namespace CWD fd to the untrusted command.
-- Execute the immutable authorized executable snapshot described in §5, never a second resolution of the original path.
+- Preserve the executable path selected by authorization in the sandbox filesystem and pass it unchanged to the supervisor; the executable's contents need not be pinned against intervening writes (see §5).
 - Scrub inherited file descriptors and environment variables.
 - Writable mounts are genuinely writable and need not be disposable.
 
@@ -261,7 +261,7 @@ trait ExecutionBackend {
 }
 ```
 
-`ExecutionPlan` contains the sealed authorized executable snapshot and its verified hash, argument vector, fd-resolved cwd mapping, sanitized environment, validated filesystem source descriptors and access modes, optional leased Baffle data endpoint, stdio configuration, and isolation/lifecycle constraints.
+`ExecutionPlan` contains the authorized absolute executable path (and the hash used in the policy decision for diagnostics), exact argument vector, fd-resolved cwd mapping, sanitized environment, validated filesystem source descriptors and access modes, optional leased Baffle data endpoint, stdio configuration, and isolation/lifecycle constraints. The backend forwards the authorized invocation instead of re-resolving the requested command.
 
 `RunningExecution` supports streamed output, exit status, cancellation and cleanup. Exact Rust type and ownership details are implementation decisions; the important property is **no orphaned process tree or leaked Baffle lease** when the caller disconnects or execution fails.
 
@@ -283,12 +283,12 @@ Nested user/network namespaces may be blocked by kernel settings, seccomp, or ro
 
 Inside the sandbox run a small Rust binary, **`gantry-supervisor`**, whose responsibilities are:
 
-1. Receive the trusted, immutable execution manifest and mounted executable snapshot. **Never search `PATH` or reopen the executable at its original requested path.**
+1. Receive the **authorized invocation** from trusted Gantry code: the resolved absolute executable path, exact argument vector, effective working directory and sanitized environment. Do not accept a separate, caller-supplied executable or resolve the original command name through `PATH`.
 2. Receive the assigned Baffle data UDS path, if networking was authorized.
 3. Verify the private loopback interface is available, then bind `127.0.0.1:3128`.
 4. For each TCP client, connect to the assigned Unix socket and forward bytes bidirectionally with Tokio.
-5. Confirm bridge readiness, then directly spawn the pinned executable with exactly the authorized arguments, cwd and sanitized environment.
-6. Supervise the command process tree and relay stdout/stderr and exit status; terminate listeners and descendants on completion/cancellation.
+5. Confirm bridge readiness, then spawn the authorized absolute path directly with the same arguments, cwd and environment (subject only to Gantry's trusted sandbox/proxy environment setup).
+6. Supervise the command process tree, relay stdout/stderr and exit status, and terminate listeners and descendants on completion/cancellation.
 
 Each invocation has its own network namespace and can reuse the same port:
 
@@ -303,25 +303,21 @@ Set trusted `http_proxy`, `https_proxy`, `HTTP_PROXY` and `HTTPS_PROXY` to `http
 
 The supervisor is **inside** the isolation boundary and has no Baffle control authority.
 
-### Executable identity across the supervisor boundary
+### Authorized command handoff
 
-**Review concern:** Previously Gantry authorized and spawned a command within the same trusted process. A supervisor that resolves the executable again creates a time-of-check/time-of-use vulnerability, even if it checks a matching path name. An open executable fd pins the inode against renames, but does **not** prevent another writer modifying its bytes in place.
+Gantry currently resolves the executable path and hashes its contents before evaluating Rego, then passes that resolved path into `Command::new(resolved_executable)` when launching the command. Retain this model even though actual process creation moves to `gantry-supervisor`.
 
-**Required handoff:**
+**Required sequence:**
 
-1. In trusted Gantry code, resolve and open the requested executable with the existing checks. Read it into a **sealed immutable snapshot**, e.g. via `memfd_create(MFD_ALLOW_SEALING)` with `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, and `F_SEAL_SEAL`. Compute the `input.hash` submitted to Rego **from that same sealed snapshot**. Prevent concurrent writes during snapshot creation and verify the snapshot before sealing where necessary.
-2. After Rego approves the snapshot's hash, build a **sealed execution manifest** holding the exact authorized `argv`, effective environment, original command identity and mapped cwd. Do not reconstruct this from untrusted data inside the sandbox.
-3. Bubblewrap mounts the snapshot as a **read-only executable** at a protected, fixed sandbox path (for example, `--perms 0555 --ro-bind-data FD /run/gantry/authorized-executable`). The mount source is the sealed descriptor, never an unchecked string path. The supervisor executes this mounted artifact rather than the original filesystem pathname.
-4. Apply the existing fd-based authorization to cwd: bind the **opened authorized directory object** into the sandbox using a descriptor-based mount, then reopen and verify its sandbox mapping before changing directory. Do not pass the parent-namespace cwd fd to the untrusted child: it could provide access outside the permitted mount view.
-5. Before command execution, close all unnecessary inherited descriptors. Ensure the supervisor cannot select an alternative executable or change the authorized manifest; only data/stdio descriptors required by execution may remain.
+1. Gantry resolves the requested executable to an **absolute path**, calculates its SHA-256 for the existing Rego check, and authorizes the command, arguments, environment and trusted cwd label.
+2. Gantry builds a typed internal **`AuthorizedInvocation`** carrying the *same resolved executable path*, exact authorized arguments, effective environment and cwd mapping. These are trusted execution-plan values, not a second command request or an opportunity for untrusted policy/profile overrides.
+3. The Bubblewrap backend makes that executable path available at the **same absolute location** inside the sandbox, using the trusted runtime baseline and/or authorized mounts. If that path cannot be executed within the filesystem policy, fail rather than running some alternative executable.
+4. Gantry passes the authorized invocation to the supervisor through a trusted launch channel (for example, process arguments or a private pipe). The supervisor must not search `PATH`, re-resolve the original command token, or evaluate Rego again. It calls `Command::new(authorized_absolute_path)` directly, sets the supplied arguments, cwd and sanitized environment, and spawns the child without a shell.
+5. Preserve Gantry's existing **fd-resolved cwd guarantee** as a separate concern: map the authorized open directory to the sandbox filesystem so that the supervisor uses the intended cwd without receiving an unrestricted parent-namespace directory fd. Ensure no privilege-expanding descriptor leaks.
 
-**Interpretation and compatibility:** ELF executables may depend on a dynamic loader and libraries from the trusted runtime baseline. A `#!` script invokes an interpreter by its shebang path; the interpreter must be trusted and available in that baseline. Verify script behaviour, executable path and `argv[0]` semantics explicitly. If equivalence cannot be proven for a supported command type, reject it rather than falling back to a second path lookup.
+**Explicit non-goal: executable TOCTOU protection.** The hash remains a point-in-time Rego input. Gantry does not need to preserve the executable inode or bytes against renames, replacements or in-place writes after authorization. Such changes are permitted by this design, as with Gantry's existing path-based spawn. No sealed snapshots, executable memfds, `execveat` handoffs, sealed manifests, or executable-byte equivalence tests are required.
 
-A descriptor-only `execveat(AT_EMPTY_PATH)` alternative is possible, but it must prove immutable bytes (an fd alone does not suffice), reliable descriptor inheritance, interpreter/shebang behaviour, and no unsafe leaked FDs. The sealed-snapshot approach is the initial recommendation.
-
-**Tests:** Deliberately rename/replace the executable path **and** mutate the original inode's bytes after authorization but before child spawn. Confirm the supervisor launches precisely the bytes whose hash Rego approved. Test cwd substitution, interpreter scripts, dynamically linked ELFs, and manifest tampering. Sandbox setup must fail closed if the trusted snapshot or cwd mount cannot be used.
-
-
+The resolved path and sandbox filesystem mapping must remain consistent as an execution *interface*: passing `/usr/bin/gh` must not accidentally start an unrelated binary at that path because of a different mount layout selected by the backend. This is a configuration correctness requirement, not a promise to defeat concurrent executable modifications. Verify ordinary ELF and shebang execution work through the new supervisor path.
 
 ### Lifetime and cancellation
 
@@ -352,7 +348,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 
 ## 7. Security acceptance requirements
 
-**Authorization:** one Rego decision, from verified input, selects no caller-controlled resource paths or proxy sessions. Reject malformed/unknown values. Retain executable hash and fd-resolved cwd guarantees through the namespace boundary.
+**Authorization:** one Rego decision, from verified input, selects no caller-controlled mount paths or Baffle sessions. Reject malformed/unknown values. Pass the authorized absolute executable path and exact invocation to the supervisor without further command-name resolution; retain the point-in-time Rego hash check and fd-resolved cwd guarantee. Do not claim executable TOCTOU protection.
 
 **Filesystem:** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
 
@@ -369,7 +365,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Rego | Allow/deny, differing filesystem/Baffle-file selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
 | `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
-| Executable/CWD | Hash and execute the same immutable executable snapshot; verify pathname swaps, in-place executable overwrites, interpreter cases and authorized cwd mounting. |
+| Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands and authorized cwd mapping. No TOCTOU/byte-pinning tests. |
 | Network | `baffle_session: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
@@ -386,7 +382,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 - Bind only a live Baffle pathname UDS into the child namespace and successfully proxy HTTPS CONNECT through it.
 - Prove unwanted parent socket/network access is blocked.
 - Test process-tree cleanup and lease loss when the parent dies.
-- Prove that the supervisor executes sealed, authorized bytes and that cwd and interpreter rules survive the namespace transition.
+- Demonstrate that the supervisor receives and runs the already-resolved absolute executable path with the authorized invocation, and that the fd-resolved cwd guarantee survives namespace setup.
 
 **Deliverable:** documented compatibility findings and any required kernel/container prerequisites. If critical assumptions fail, adjust the enforcement design before implementing the full backend.
 
@@ -394,7 +390,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 - Implement the structured Rego result and migration from boolean `allow`.
 - Define direct-path filesystem profile schema, Baffle configuration filename validation, and policy reload consistency.
-- Build an immutable validated `ExecutionPlan` with sealed executable snapshot and authorized cwd mapping.
+- Build a validated `ExecutionPlan` with the already-authorized executable path, arguments, effective environment and cwd mapping.
 - Extend `/check` and tests without side effects.
 
 **Deliverable:** a policy-only dry run showing selected source paths and Baffle configuration file.
@@ -403,7 +399,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 
 - Introduce `ExecutionBackend` and `RunningExecution` lifecycle types.
 - Implement isolated per-command Bubblewrap execution without external networking.
-- Implement sealed executable/manifest handoff and preserve authorized CWD, output and cancellation semantics.
+- Implement simple authorized-invocation handoff to the supervisor without a new executable lookup; preserve authorized cwd, output and cancellation semantics.
 - Add filesystem and namespace escape tests.
 
 **Deliverable:** authorized commands run in isolated, no-network filesystem environments.
@@ -430,7 +426,7 @@ Include negative tests that deliberately attempt to connect to the parent proxy 
 ## 10. Open decisions
 
 1. **Trusted runtime root:** How should Gantry define and provision the minimum executable, dynamic libraries and system files while avoiding wholesale exposure of the parent root filesystem?
-2. **Filesystem source integrity:** Which descriptor-based Linux APIs and mount strategy will preserve the authorized executable, cwd and resource identity across Bubblewrap setup?
+2. **Filesystem source integrity:** Which descriptor-based Linux APIs and mount strategy will preserve authorized cwd and mount-source identity across Bubblewrap setup? Executable byte/inode identity across the authorization-to-spawn interval is explicitly not required.
 3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
 4. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
 5. **Process-tree termination:** Are PID namespaces plus supervisor signalling sufficient for all supported environments, or does Gantry additionally require cgroups or another reaper mechanism?
@@ -449,7 +445,7 @@ This feature is complete when:
 - Optional Baffle access provisions a unique ephemeral session per command and keeps its lease until execution cleanup.
 - The Rust supervisor supplies the local HTTP proxy via an in-process TCP-to-UDS bridge on `127.0.0.1:3128`, without `socat`.
 - Concurrent commands have independent proxy and filesystem authority.
-- The supervisor launches only the sealed authorized executable snapshot, not a second pathname lookup. Existing command and check transports preserve their observable output/exit/cancellation contracts, with selected filesystem/Baffle names added to check diagnostics.
+- The supervisor launches the same resolved absolute executable path and invocation authorized by Gantry, without another command-name lookup or policy evaluation. Executable changes after authorization are outside the guarantees. Existing command and check transports preserve their observable output/exit/cancellation contracts, with selected filesystem/Baffle names added to check diagnostics.
 - All setup, isolation, provisioning and cleanup failures fail closed.
 - The decision and profile contracts do not mention Bubblewrap and can be implemented by another enforcing backend.
 
