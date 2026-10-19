@@ -378,7 +378,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 
 **Authorization:** one Rego decision, from verified input, selects no caller-controlled mount paths or Baffle sessions. Reject malformed/unknown values. Pass the authorized absolute executable path and exact invocation to the supervisor without further command-name resolution; retain the point-in-time Rego hash check and trusted CWD input. Do not claim executable TOCTOU protection.
 
-**Filesystem:** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
+**Filesystem (Bubblewrap):** only direct paths declared in trusted filesystem profiles and a minimal runtime baseline are accessible. Direct retains the Gantry process filesystem view. Deny path/symlink races, protected mount shadowing, leaked control sockets and inherited privileged FDs. Honor read-only vs read-write semantics.
 
 **Network:** no direct external route, reachable parent proxy, or cross-command proxy connection. The selected Baffle UDS is the sole external-egress capability. No control socket or credential secret is visible inside the sandbox. Proxy failures never trigger direct fallback.
 
