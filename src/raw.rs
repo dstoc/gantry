@@ -102,7 +102,6 @@ pub async fn raw_handler(
     };
 
     let executable = input.executable.clone();
-    let args_for_log = input.args.clone();
 
     let mut execution = match start_command_process_with_baffle_config(
         &state.policy_engine,
@@ -115,11 +114,21 @@ pub async fn raw_handler(
     {
         Ok(child) => child,
         Err(ToolError::Validation(error)) => {
-            tracing::warn!(command = %executable, args = ?args_for_log, error = %error, "raw request denied by policy");
+            tracing::warn!(
+                command = %executable,
+                backend = state.backend.as_str(),
+                phase = "authorization",
+                "raw request denied by policy",
+            );
             return error_response(StatusCode::FORBIDDEN, error.to_string());
         }
         Err(error) => {
-            tracing::error!(command = %executable, args = ?args_for_log, error = %error, "raw request failed before stream start");
+            tracing::error!(
+                command = %executable,
+                backend = state.backend.as_str(),
+                phase = "setup",
+                "raw request failed before stream start",
+            );
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
     };
@@ -128,7 +137,7 @@ pub async fn raw_handler(
         Some(stdout) => stdout,
         None => {
             execution.cancel().await;
-            tracing::error!(command = %executable, args = ?args_for_log, "stdout pipe missing");
+            tracing::error!(command = %executable, "stdout pipe missing");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "stdout pipe missing".to_string(),
@@ -139,7 +148,7 @@ pub async fn raw_handler(
         Some(stderr) => stderr,
         None => {
             execution.cancel().await;
-            tracing::error!(command = %executable, args = ?args_for_log, "stderr pipe missing");
+            tracing::error!(command = %executable, "stderr pipe missing");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "stderr pipe missing".to_string(),
@@ -147,16 +156,20 @@ pub async fn raw_handler(
         }
     };
 
-    tracing::info!(command = %executable, args = ?args_for_log, "raw request accepted");
+    tracing::info!(
+        command = %executable,
+        backend = execution.diagnostics().backend.as_str(),
+        filesystem_profile = ?execution.diagnostics().filesystem_profile,
+        baffle_filename = ?execution.diagnostics().baffle_filename,
+        baffle_session_id = ?execution.baffle_session_id(),
+        phase = "command",
+        outcome = "started",
+        "raw request accepted",
+    );
 
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(stream_process_events(
-        execution,
-        stdout,
-        stderr,
-        tx,
-        executable,
-        args_for_log,
+        execution, stdout, stderr, tx, executable,
     ));
 
     let body_stream = ReceiverStream::new(rx).map(Ok::<_, Infallible>);
@@ -185,7 +198,6 @@ pub async fn check_handler(
     };
 
     let executable = input.executable.clone();
-    let args_for_log = input.args.clone();
     let decision: RunCommandCheckOutput = check_command_with_backend(
         &state.policy_engine,
         &state.default_cwd,
@@ -195,10 +207,12 @@ pub async fn check_handler(
 
     tracing::info!(
         command = %executable,
-        args = ?args_for_log,
+        backend = state.backend.as_str(),
         allowed = decision.allowed,
         policy_mode = %decision.policy_mode,
-        reason = ?decision.reason,
+        filesystem_profile = ?decision.filesystem,
+        baffle_filename = ?decision.baffle_session,
+        phase = "authorization",
         "check request evaluated",
     );
 
@@ -211,11 +225,10 @@ async fn stream_process_events(
     stderr: OutputReader,
     tx: mpsc::Sender<Bytes>,
     executable: String,
-    args: Vec<String>,
 ) {
     let started = Instant::now();
     if !send_event(&tx, &RawStreamEvent::Start {}).await {
-        tracing::info!(command = %executable, args = ?args, "raw client disconnected before start event");
+        tracing::info!(command = %executable, "raw client disconnected before start event");
         execution.cancel().await;
         return;
     }
@@ -241,7 +254,7 @@ async fn stream_process_events(
     loop {
         tokio::select! {
             _ = tx.closed() => {
-                tracing::info!(command = %executable, args = ?args, "raw client disconnected while waiting for command");
+                tracing::info!(command = %executable, "raw client disconnected while waiting for command");
                 execution.cancel().await;
                 stop_output_readers(&mut reader_tasks).await;
                 return;
@@ -252,7 +265,13 @@ async fn stream_process_events(
                         exit_code = Some(status.code());
                     }
                     Err(error) => {
-                        tracing::error!(command = %executable, args = ?args, error = %error, "raw runtime wait failure");
+                        tracing::error!(
+                            command = %executable,
+                            backend = execution.diagnostics().backend.as_str(),
+                            phase = "cleanup",
+                            error = %error,
+                            "raw runtime wait failure",
+                        );
                         let _ = send_event(&tx, &RawStreamEvent::Error { message: format!("Runtime wait failure: {error}") }).await;
                         execution.cancel().await;
                         stop_output_readers(&mut reader_tasks).await;
@@ -269,7 +288,7 @@ async fn stream_process_events(
                             OutputStreamKind::Stderr => RawStreamEvent::Stderr { data_b64 },
                         };
                         if !send_event(&tx, &event).await {
-                            tracing::info!(command = %executable, args = ?args, "raw client disconnected during stream");
+                            tracing::info!(command = %executable, "raw client disconnected during stream");
                             execution.cancel().await;
                             stop_output_readers(&mut reader_tasks).await;
                             return;
@@ -280,7 +299,14 @@ async fn stream_process_events(
                         OutputStreamKind::Stderr => stderr_done = true,
                     },
                     Some(ReaderEvent::ReadError { stream, message }) => {
-                        tracing::error!(command = %executable, args = ?args, stream = stream.as_str(), error = %message, "raw stream read failure");
+                        tracing::error!(
+                            command = %executable,
+                            backend = execution.diagnostics().backend.as_str(),
+                            stream = stream.as_str(),
+                            phase = "command_output",
+                            error = %message,
+                            "raw stream read failure",
+                        );
                         let _ = send_event(
                             &tx,
                             &RawStreamEvent::Error {
@@ -316,14 +342,17 @@ async fn stream_process_events(
     )
     .await
     {
-        tracing::info!(command = %executable, args = ?args, "raw client disconnected before exit event");
+        tracing::info!(command = %executable, "raw client disconnected before exit event");
         execution.cancel().await;
         return;
     }
 
     tracing::info!(
         command = %executable,
-        args = ?args,
+        backend = execution.diagnostics().backend.as_str(),
+        filesystem_profile = ?execution.diagnostics().filesystem_profile,
+        baffle_filename = ?execution.diagnostics().baffle_filename,
+        baffle_session_id = ?execution.baffle_session_id(),
         exit_code = ?final_exit_code,
         duration_ms = started.elapsed().as_millis() as u64,
         "raw request completed",

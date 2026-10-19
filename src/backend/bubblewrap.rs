@@ -21,7 +21,9 @@ mod linux {
         BaffleRuntimeConfig, BaffleSessionLease, SANDBOX_CA_CERTIFICATE, SANDBOX_SOCKET,
         create_ephemeral_session,
     };
-    use crate::execution::{ExecutionExitStatus, ExecutionPlan, RunningExecution};
+    use crate::execution::{
+        ExecutionDiagnostics, ExecutionExitStatus, ExecutionPlan, RunningExecution,
+    };
     use crate::filesystem::{FilesystemMount, MountAccess};
 
     const SUPERVISOR_TARGET: &str = "/run/gantry-supervisor";
@@ -69,6 +71,7 @@ mod linux {
         plan: ExecutionPlan,
         baffle: BaffleRuntimeConfig,
     ) -> Result<RunningExecution, StartError> {
+        let diagnostics = ExecutionDiagnostics::from_plan(&plan);
         plan.validate_compatibility().map_err(StartError::Setup)?;
         let supervisor = find_supervisor().map_err(StartError::Setup)?;
         let bubblewrap = find_bubblewrap().map_err(StartError::Setup)?;
@@ -248,7 +251,8 @@ mod linux {
         let child = command.spawn().map_err(|error| {
             StartError::Setup(format!("failed to start Bubblewrap launcher: {error}"))
         })?;
-        let mut execution = RunningExecution::new_starting(child, true, baffle_lease.take());
+        let mut execution =
+            RunningExecution::new_starting(child, true, baffle_lease.take(), diagnostics);
         drop(inherited_mount_fds);
         drop(mounts);
 
@@ -329,10 +333,13 @@ mod linux {
             }
         }
 
+        let baffle_session_id = execution.baffle_session_id().map(str::to_owned);
         tracing::debug!(
             executable_hash = %plan.invocation.executable_hash,
             policy_generation = plan.invocation.generation.id(),
             filesystem_profile = %profile.name,
+            baffle_filename = ?plan.baffle_session,
+            baffle_session_id = ?baffle_session_id,
             cwd = %plan.invocation.cwd.display(),
             "Bubblewrap supervisor started authorized invocation",
         );

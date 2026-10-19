@@ -63,6 +63,25 @@ pub(crate) struct ExecutionPlan {
     pub(crate) baffle_session: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionDiagnostics {
+    pub(crate) backend: ExecutionBackend,
+    pub(crate) filesystem_profile: Option<String>,
+    pub(crate) baffle_filename: Option<String>,
+    pub(crate) baffle_session_id: Option<String>,
+}
+
+impl ExecutionDiagnostics {
+    pub(crate) fn from_plan(plan: &ExecutionPlan) -> Self {
+        Self {
+            backend: plan.backend,
+            filesystem_profile: plan.filesystem.as_ref().map(|profile| profile.name.clone()),
+            baffle_filename: plan.baffle_session.clone(),
+            baffle_session_id: None,
+        }
+    }
+}
+
 impl ExecutionPlan {
     pub(crate) fn validate_compatibility(&self) -> Result<(), String> {
         match self.backend {
@@ -97,6 +116,7 @@ pub(crate) struct RunningExecution {
     final_status: Option<FinalStatusReceiver>,
     completed_status: Option<ExecutionExitStatus>,
     baffle_lease: Option<crate::baffle::BaffleSessionLease>,
+    diagnostics: ExecutionDiagnostics,
 }
 
 pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -152,7 +172,11 @@ impl ExecutionExitStatus {
 type FinalStatusReceiver = oneshot::Receiver<Result<ExecutionExitStatus, io::Error>>;
 
 impl RunningExecution {
-    pub(crate) fn new(mut child: Child, terminate_process_group: bool) -> Self {
+    pub(crate) fn new(
+        mut child: Child,
+        terminate_process_group: bool,
+        diagnostics: ExecutionDiagnostics,
+    ) -> Self {
         let stdout = child
             .stdout
             .take()
@@ -161,7 +185,7 @@ impl RunningExecution {
             .stderr
             .take()
             .map(|reader| Box::new(reader) as OutputReader);
-        let mut execution = Self::new_starting(child, terminate_process_group, None);
+        let mut execution = Self::new_starting(child, terminate_process_group, None, diagnostics);
         execution.stdout = stdout;
         execution.stderr = stderr;
         execution
@@ -171,7 +195,9 @@ impl RunningExecution {
         child: Child,
         terminate_process_group: bool,
         baffle_lease: Option<crate::baffle::BaffleSessionLease>,
+        mut diagnostics: ExecutionDiagnostics,
     ) -> Self {
+        diagnostics.baffle_session_id = baffle_lease.as_ref().map(|lease| lease.id().to_owned());
         let process_group = terminate_process_group
             .then(|| child.id().map(|pid| pid as i32))
             .flatten();
@@ -183,7 +209,16 @@ impl RunningExecution {
             final_status: None,
             completed_status: None,
             baffle_lease,
+            diagnostics,
         }
+    }
+
+    pub(crate) fn diagnostics(&self) -> &ExecutionDiagnostics {
+        &self.diagnostics
+    }
+
+    pub(crate) fn baffle_session_id(&self) -> Option<&str> {
+        self.diagnostics.baffle_session_id.as_deref()
     }
 
     pub(crate) fn child_mut(&mut self) -> &mut Child {
@@ -228,15 +263,41 @@ impl RunningExecution {
             ExecutionExitStatus::from_process(status)
         };
         self.completed_status = Some(status);
+        let baffle_session_id = self.diagnostics.baffle_session_id.clone();
         self.baffle_lease.take();
+        tracing::info!(
+            backend = self.diagnostics.backend.as_str(),
+            filesystem_profile = ?self.diagnostics.filesystem_profile,
+            baffle_filename = ?self.diagnostics.baffle_filename,
+            baffle_session_id = ?baffle_session_id,
+            phase = "cleanup",
+            outcome = "complete",
+            command_outcome = if status.code() == Some(0) {
+                "success"
+            } else {
+                "failed"
+            },
+            exit_code = ?status.code(),
+            "execution finished and resources were released",
+        );
         Ok(status)
     }
 
     pub(crate) async fn cancel(&mut self) {
+        let baffle_session_id = self.diagnostics.baffle_session_id.clone();
         self.terminate_descendants();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
         self.baffle_lease.take();
+        tracing::info!(
+            backend = self.diagnostics.backend.as_str(),
+            filesystem_profile = ?self.diagnostics.filesystem_profile,
+            baffle_filename = ?self.diagnostics.baffle_filename,
+            baffle_session_id = ?baffle_session_id,
+            phase = "cleanup",
+            outcome = "cancelled_and_released",
+            "execution cancellation cleanup finished",
+        );
     }
 
     fn terminate_descendants(&self) {
@@ -257,6 +318,12 @@ impl Drop for RunningExecution {
         };
         let pid = self.child.id();
         let _ = self.child.start_kill();
+        let diagnostics = self.diagnostics.clone();
+        let baffle_session_id = self
+            .diagnostics
+            .baffle_session_id
+            .clone()
+            .unwrap_or_default();
 
         #[cfg(unix)]
         if let Some(pid) = pid {
@@ -277,11 +344,29 @@ impl Drop for RunningExecution {
                     }
                 }
                 drop(lease);
+                tracing::info!(
+                    backend = diagnostics.backend.as_str(),
+                    filesystem_profile = ?diagnostics.filesystem_profile,
+                    baffle_filename = ?diagnostics.baffle_filename,
+                    baffle_session_id = %baffle_session_id,
+                    phase = "cleanup",
+                    outcome = "cancelled_and_released",
+                    "dropped execution cleanup finished",
+                );
             });
             return;
         }
 
         drop(lease);
+        tracing::info!(
+            backend = diagnostics.backend.as_str(),
+            filesystem_profile = ?diagnostics.filesystem_profile,
+            baffle_filename = ?diagnostics.baffle_filename,
+            baffle_session_id = %baffle_session_id,
+            phase = "cleanup",
+            outcome = "released",
+            "dropped execution lease released",
+        );
     }
 }
 
@@ -414,7 +499,17 @@ mod tests {
 
         let (status_read_tx, status_read_rx) = tokio::sync::oneshot::channel();
         let startup = tokio::spawn(async move {
-            let mut execution = RunningExecution::new_starting(child, true, Some(lease));
+            let mut execution = RunningExecution::new_starting(
+                child,
+                true,
+                Some(lease),
+                ExecutionDiagnostics {
+                    backend: ExecutionBackend::Bubblewrap,
+                    filesystem_profile: Some("test".to_owned()),
+                    baffle_filename: Some("startup-test.toml".to_owned()),
+                    baffle_session_id: None,
+                },
+            );
             let stdout = execution
                 .child_mut()
                 .stdout

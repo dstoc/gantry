@@ -24,7 +24,7 @@ Policy decisions are made by [Rego](https://www.openpolicyagent.org/docs/policy-
 - Runtime is fail-closed:
   - if policy load fails at startup, server still starts but denies all requests
   - if policy reload fails, engine switches to deny-all until a valid policy set is loaded
-- CWD authorization uses the same fd-resolved cwd for policy and execution. See [CWD Policy Guarantees](docs/cwd-policy-guarantees.md) for exact guarantees and non-guarantees.
+- CWD authorization uses the fd-resolved cwd label for Rego. Direct uses the opened directory for execution. Bubblewrap passes the authorized absolute path to the supervisor, which resolves it inside the sandbox and fails if it is unavailable. See [CWD Policy Guarantees](docs/cwd-policy-guarantees.md) for exact guarantees and limits.
 
 Policy checks are advisory and point-in-time:
 
@@ -126,6 +126,8 @@ nw_sandbox/
 
 `gantry` evaluates `data.sandbox.main.decision`. Every allowed decision must set all three fields. Use explicit `null` values when the policy does not select a filesystem profile or Baffle session. Missing fields do not mean `null`.
 
+The default Bubblewrap backend requires a named profile. For an explicitly selected Direct backend, both selection fields must be `null`.
+
 ```rego
 package sandbox.main
 
@@ -137,11 +139,23 @@ default decision := {
 
 decision := {
     "allow": true,
-    "filesystem": null,
+    "filesystem": "workspace-readonly",
     "baffle_session": null,
 } if {
     data.sandbox[input.command].allow
     count(object.keys(input.env)) == 0
+}
+```
+
+For a Direct deployment, use the same structured contract with both policy selections set to `null`, then start the server with `--backend direct`:
+
+```rego
+decision := {
+    "allow": true,
+    "filesystem": null,
+    "baffle_session": null,
+} if {
+    data.sandbox[input.command].allow
 }
 ```
 

@@ -118,11 +118,16 @@ impl BaffleRuntimeConfig {
 pub(crate) struct BaffleSessionLease {
     session: Option<Session>,
     socket_path: PathBuf,
+    id: String,
 }
 
 impl BaffleSessionLease {
     pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -163,6 +168,7 @@ pub(crate) async fn create_ephemeral_session(
         return Err("Baffle returned a non-absolute session socket path".to_string());
     }
     let socket_path = session.socket_path().to_path_buf();
+    let id = session.id().to_owned();
     let socket_directory = canonicalize_or_original(config.session_socket_dir.as_path());
     let resolved_socket = canonicalize_or_original(&socket_path);
     if !resolved_socket.starts_with(&socket_directory) {
@@ -183,6 +189,7 @@ pub(crate) async fn create_ephemeral_session(
     Ok(BaffleSessionLease {
         session: Some(session),
         socket_path,
+        id,
     })
 }
 

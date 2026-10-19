@@ -4,12 +4,13 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::backend::StartError;
-use crate::execution::{ExecutionPlan, RunningExecution};
+use crate::execution::{ExecutionDiagnostics, ExecutionPlan, RunningExecution};
 
 pub(super) fn start(
     plan: ExecutionPlan,
     trusted_cwd_fd: RawFd,
 ) -> Result<RunningExecution, StartError> {
+    let diagnostics = ExecutionDiagnostics::from_plan(&plan);
     let invocation = plan.invocation;
     tracing::debug!(
         executable_hash = %invocation.executable_hash,
@@ -49,5 +50,5 @@ pub(super) fn start(
     );
 
     let child = command.spawn().map_err(StartError::Spawn)?;
-    Ok(RunningExecution::new(child, true))
+    Ok(RunningExecution::new(child, true, diagnostics))
 }

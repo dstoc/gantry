@@ -4,9 +4,9 @@ This document defines the security and policy guarantees for `gantry`'s trusted 
 
 `gantry` exposes a Rego field, `input.cwd`, so policies can authorize commands based on the effective working directory where the command would run. The field is not copied from user input. It is produced by trusted Rust code during the shared pre-spawn authorization path.
 
-The core invariant is:
+The authorization invariant is:
 
-> Rego receives the trusted cwd label produced by the fd-based resolver, and execution uses the same opened directory fd that produced that label.
+> Rego receives the trusted cwd label produced by the fd-based resolver. The selected backend applies its documented CWD guarantee during execution.
 
 ## Terminology
 
@@ -87,7 +87,7 @@ When cwd resolution succeeds, `gantry` can guarantee the following.
 3. `input.cwd` is the trusted resolved lexical cwd label produced by the resolver without following symlinks or magic links.
 4. At resolution time, every component in `input.cwd` was opened as a real directory relative to the already-open fd for its parent directory.
 5. At resolution time, the final cwd fd was reached by walking the components represented by `input.cwd`.
-6. The final cwd used for execution is the same opened directory fd that produced `input.cwd`.
+6. The resolver keeps the final opened directory fd through authorization. Direct uses this fd for execution. Bubblewrap uses the authorized absolute path inside its restricted filesystem view.
 7. If a symlink or magic link appears in the input path, the request is rejected before Rego.
 8. If any component is `.`, `..`, or cannot be opened as a directory without following symlinks, the request is rejected before Rego.
 9. If the parent directories along the path are attacker-immutable, then the corresponding path components cannot be attacker-retargeted during resolution.
@@ -136,13 +136,21 @@ The resolver does not guarantee:
 6. That a `/check` result can be reused for later execution without a fresh resolution and authorization.
 7. That command execution is filesystem-sandboxed. The cwd guarantee only controls the initial cwd used for process spawn.
 
-## Execution Guarantee
+## Backend Execution Guarantees
+
+### Direct
 
 For execution, `gantry` mitigates the final-cwd TOCTOU issue by holding the opened cwd fd and using that same fd for spawn.
 
 On Unix, execution changes cwd in the child process with `fchdir(fd)` from a minimal `pre_exec` hook. Execution must not call `Command::current_dir` with the raw request cwd after authorization.
 
 If the raw path is renamed or replaced after authorization, the spawned process still starts in the opened directory object that Rego evaluated.
+
+### Bubblewrap
+
+Gantry passes the authorized absolute CWD path to `gantry-supervisor`. The supervisor sets that path as the command CWD inside the restricted filesystem view. If the path is absent or inaccessible there, command startup fails.
+
+Bubblewrap does not receive the opened CWD fd. The path may resolve to a different directory if the host namespace changes after authorization. CWD identity handoff and identity verification are outside this proposal's guarantees.
 
 ## Check Freshness
 

@@ -1,5 +1,6 @@
 package sandbox.main
 
+# This policy selects Direct. Start Gantry with `--backend direct`.
 default decision := {
   "allow": false,
   "filesystem": null,
