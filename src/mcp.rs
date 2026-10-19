@@ -13,9 +13,10 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
 use thiserror::Error;
 
+use crate::execution::ExecutionBackend;
 use crate::executor::{
-    RunCommandCheckOutput, RunCommandInput, RunCommandOutput, check_command as check_command_impl,
-    run_command_impl,
+    RunCommandCheckOutput, RunCommandInput, RunCommandOutput,
+    check_command_with_backend as check_command_impl, run_command_with_backend,
 };
 use crate::policy::{PolicyEngine, PolicyMode};
 use crate::raw::{RawEndpointState, check_handler, raw_handler};
@@ -27,20 +28,90 @@ pub struct AppConfig {
     pub bind_addr: Option<SocketAddr>,
     pub bind_uds: Option<PathBuf>,
     pub policy_dir: Option<PathBuf>,
+    pub backend: ExecutionBackend,
     pub default_cwd: PathBuf,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_env_with(|name| std::env::var(name).ok())
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        Self::from_args_and_env(&args, |name| std::env::var(name).ok())
     }
 
+    #[cfg(test)]
     fn from_env_with<F>(mut lookup: F) -> Result<Self, ConfigError>
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let bind_uds_raw = normalize_env_value(lookup("MCP_BIND_UDS"));
-        let bind_addr_raw = normalize_env_value(lookup("MCP_BIND_ADDR"));
+        Self::from_args_and_env(&[], &mut lookup)
+    }
+
+    fn from_args_and_env<F>(args: &[String], mut lookup: F) -> Result<Self, ConfigError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut cli_bind_addr = None;
+        let mut cli_bind_uds = None;
+        let mut cli_policy_dir = None;
+        let mut cli_backend = None;
+        let mut listener_flag_supplied = false;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            let (flag, inline_value) = arg
+                .split_once('=')
+                .map(|(flag, value)| (flag, Some(value.to_string())))
+                .unwrap_or((arg.as_str(), None));
+            if !["--bind-addr", "--bind-uds", "--policy-dir", "--backend"].contains(&flag) {
+                return Err(ConfigError::UnknownArgument(arg.clone()));
+            }
+            if !seen.insert(flag.to_string()) {
+                return Err(ConfigError::DuplicateArgument(flag.to_string()));
+            }
+            let value = match inline_value {
+                Some(value) if !value.is_empty() => value,
+                Some(_) => return Err(ConfigError::MissingArgumentValue(flag.to_string())),
+                None => {
+                    index += 1;
+                    args.get(index)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                        .ok_or_else(|| ConfigError::MissingArgumentValue(flag.to_string()))?
+                }
+            };
+            match flag {
+                "--bind-addr" => {
+                    listener_flag_supplied = true;
+                    cli_bind_addr = Some(value);
+                }
+                "--bind-uds" => {
+                    listener_flag_supplied = true;
+                    cli_bind_uds = Some(value);
+                }
+                "--policy-dir" => cli_policy_dir = Some(value),
+                "--backend" => {
+                    cli_backend = Some(
+                        value
+                            .parse::<ExecutionBackend>()
+                            .map_err(|details| ConfigError::InvalidBackend { details })?,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            index += 1;
+        }
+
+        let bind_addr_raw = if listener_flag_supplied {
+            cli_bind_addr
+        } else {
+            normalize_env_value(lookup("GANTRY_BIND_ADDR"))
+        };
+        let bind_uds_raw = if listener_flag_supplied {
+            cli_bind_uds
+        } else {
+            normalize_env_value(lookup("GANTRY_BIND_UDS"))
+        };
 
         if bind_uds_raw.is_some() && bind_addr_raw.is_some() {
             return Err(ConfigError::ConflictingBindTargets);
@@ -64,10 +135,21 @@ impl AppConfig {
                 })?)
             };
 
-        let policy_dir = lookup("POLICY_DIR")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        let policy_dir = if let Some(value) = cli_policy_dir {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ConfigError::MissingArgumentValue(
+                    "--policy-dir".to_string(),
+                ));
+            }
+            Some(PathBuf::from(value))
+        } else {
+            lookup("GANTRY_POLICY_DIR")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        let backend = cli_backend.unwrap_or(ExecutionBackend::Direct);
         let default_cwd =
             std::env::current_dir().map_err(|source| ConfigError::CurrentDir { source })?;
         validate_default_cwd(&default_cwd)?;
@@ -76,6 +158,7 @@ impl AppConfig {
             bind_addr,
             bind_uds,
             policy_dir,
+            backend,
             default_cwd,
         })
     }
@@ -144,22 +227,32 @@ fn is_unix_socket(metadata: &fs::Metadata) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("MCP_BIND_ADDR and MCP_BIND_UDS cannot both be set")]
+    #[error(
+        "GANTRY_BIND_ADDR and GANTRY_BIND_UDS cannot both be set, or both listener flags were supplied"
+    )]
     ConflictingBindTargets,
-    #[error("invalid MCP_BIND_ADDR '{value}': {source}")]
+    #[error("unknown server argument: {0}")]
+    UnknownArgument(String),
+    #[error("server argument supplied more than once: {0}")]
+    DuplicateArgument(String),
+    #[error("missing or empty value for {0}")]
+    MissingArgumentValue(String),
+    #[error("{details}")]
+    InvalidBackend { details: String },
+    #[error("invalid GANTRY_BIND_ADDR '{value}': {source}")]
     InvalidBindAddr {
         value: String,
         source: AddrParseError,
     },
-    #[error("MCP_BIND_UDS must be an absolute path: '{value}'")]
+    #[error("GANTRY_BIND_UDS must be an absolute path: '{value}'")]
     RelativeBindUds { value: String },
-    #[error("MCP_BIND_UDS parent directory does not exist: '{value}'")]
+    #[error("GANTRY_BIND_UDS parent directory does not exist: '{value}'")]
     MissingBindUdsParent { value: String },
-    #[error("MCP_BIND_UDS path exists but is not a unix socket: {path:?}")]
+    #[error("GANTRY_BIND_UDS path exists but is not a unix socket: {path:?}")]
     BindUdsNotSocket { path: PathBuf },
-    #[error("failed to inspect MCP_BIND_UDS path: {source}")]
+    #[error("failed to inspect GANTRY_BIND_UDS path: {source}")]
     BindUdsMetadata { source: std::io::Error },
-    #[error("failed to remove stale MCP_BIND_UDS socket: {source}")]
+    #[error("failed to remove stale GANTRY_BIND_UDS socket: {source}")]
     BindUdsRemove { source: std::io::Error },
     #[error("failed to get current working directory: {source}")]
     CurrentDir { source: std::io::Error },
@@ -179,15 +272,21 @@ pub enum AppError {
 pub struct McpRunServer {
     policy_engine: Arc<PolicyEngine>,
     default_cwd: PathBuf,
+    backend: ExecutionBackend,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl McpRunServer {
-    pub fn new(policy_engine: Arc<PolicyEngine>, default_cwd: PathBuf) -> Self {
+    pub fn new(
+        policy_engine: Arc<PolicyEngine>,
+        default_cwd: PathBuf,
+        backend: ExecutionBackend,
+    ) -> Self {
         Self {
             policy_engine,
             default_cwd,
+            backend,
             tool_router: Self::tool_router(),
         }
     }
@@ -200,7 +299,7 @@ impl McpRunServer {
         &self,
         Parameters(input): Parameters<RunCommandInput>,
     ) -> Result<Json<RunCommandOutput>, String> {
-        run_command_impl(&self.policy_engine, &self.default_cwd, input)
+        run_command_with_backend(&self.policy_engine, &self.default_cwd, self.backend, input)
             .await
             .map(Json)
             .map_err(|error| error.to_string())
@@ -217,6 +316,7 @@ impl McpRunServer {
         Ok(Json(check_command_impl(
             &self.policy_engine,
             &self.default_cwd,
+            self.backend,
             input,
         )))
     }
@@ -235,19 +335,28 @@ impl ServerHandler for McpRunServer {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some("Use run_command to execute allowlisted commands and check_command to inspect policy decisions. Requests are validated against POLICY_DIR Rego policy modules.".to_string()),
+            instructions: Some("Use run_command to execute allowlisted commands and check_command to inspect policy decisions. Requests use GANTRY_POLICY_DIR Rego policies and administrator-controlled filesystem profiles.".to_string()),
             ..Default::default()
         }
     }
 }
 
 pub fn build_app(policy_engine: Arc<PolicyEngine>, default_cwd: PathBuf) -> Router {
+    build_app_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct)
+}
+
+pub fn build_app_with_backend(
+    policy_engine: Arc<PolicyEngine>,
+    default_cwd: PathBuf,
+    backend: ExecutionBackend,
+) -> Router {
     let session_manager = Arc::new(LocalSessionManager::default());
     let policy_for_factory = policy_engine.clone();
     let cwd_for_factory = default_cwd.clone();
     let raw_state = RawEndpointState {
         policy_engine,
         default_cwd,
+        backend,
     };
 
     let mcp_service = StreamableHttpService::new(
@@ -255,6 +364,7 @@ pub fn build_app(policy_engine: Arc<PolicyEngine>, default_cwd: PathBuf) -> Rout
             Ok(McpRunServer::new(
                 policy_for_factory.clone(),
                 cwd_for_factory.clone(),
+                backend,
             ))
         },
         session_manager,
@@ -280,11 +390,12 @@ pub async fn serve(config: AppConfig) -> Result<(), AppError> {
             PolicyMode::Rego => "rego",
             PolicyMode::DenyAll => "deny-all",
         },
+        backend = config.backend.as_str(),
         policy_dir = ?config.policy_dir.as_ref().map(|path| path.display().to_string()),
         "starting gantry server",
     );
 
-    let app = build_app(policy_engine, config.default_cwd.clone());
+    let app = build_app_with_backend(policy_engine, config.default_cwd.clone(), config.backend);
     if let Some(bind_uds) = config.bind_uds.as_deref() {
         prepare_bind_uds_path(bind_uds)?;
         let listener = tokio::net::UnixListener::bind(bind_uds)?;
@@ -335,7 +446,7 @@ mod tests {
         }
 
         let main = format!(
-            "package sandbox.main\n\ndefault allow = false\n\nallowed_commands := {{\n{allowed_map}}}\n\nallow if {{\n  allowed_commands[input.command]\n}}\n"
+            "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\nallowed_commands := {{\n{allowed_map}}}\n\ndecision := {{\"allow\": true, \"filesystem\": null, \"baffle_session\": null}} if {{\n  allowed_commands[input.command]\n}}\n"
         );
 
         PolicyEngine::from_rego_for_tests(&[("main.rego", &main)])
@@ -346,8 +457,8 @@ mod tests {
         bind_uds: Option<&str>,
     ) -> Result<AppConfig, ConfigError> {
         AppConfig::from_env_with(|name| match name {
-            "MCP_BIND_ADDR" => bind_addr.map(|value| value.to_string()),
-            "MCP_BIND_UDS" => bind_uds.map(|value| value.to_string()),
+            "GANTRY_BIND_ADDR" => bind_addr.map(|value| value.to_string()),
+            "GANTRY_BIND_UDS" => bind_uds.map(|value| value.to_string()),
             _ => None,
         })
     }
@@ -358,6 +469,7 @@ mod tests {
             bind_addr: Some("127.0.0.1:0".parse().expect("bind addr")),
             bind_uds: None,
             policy_dir: None,
+            backend: ExecutionBackend::Direct,
             default_cwd: PathBuf::from("."),
         };
 
@@ -386,8 +498,8 @@ mod tests {
         let socket_path = tempdir.path().join("gantry.sock");
 
         let config = AppConfig::from_env_with(|name| match name {
-            "MCP_BIND_ADDR" => Some("   ".to_string()),
-            "MCP_BIND_UDS" => Some(socket_path.to_string_lossy().into_owned()),
+            "GANTRY_BIND_ADDR" => Some("   ".to_string()),
+            "GANTRY_BIND_UDS" => Some(socket_path.to_string_lossy().into_owned()),
             _ => None,
         })
         .expect("empty addr should not conflict");
@@ -413,6 +525,112 @@ mod tests {
         assert!(matches!(error, ConfigError::MissingBindUdsParent { .. }));
     }
 
+    #[test]
+    fn cli_listener_selection_overrides_both_listener_environment_values() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket = tempdir
+            .path()
+            .join("gantry.sock")
+            .to_string_lossy()
+            .into_owned();
+        let args = vec!["--bind-uds".to_string(), socket.clone()];
+        let config = AppConfig::from_args_and_env(&args, |name| match name {
+            "GANTRY_BIND_ADDR" => Some("not-an-address".to_string()),
+            "GANTRY_BIND_UDS" => Some("relative.sock".to_string()),
+            _ => None,
+        })
+        .expect("CLI UDS selection ignores both environment values");
+        assert_eq!(config.bind_uds.as_deref(), Some(Path::new(&socket)));
+        assert_eq!(config.bind_addr, None);
+
+        let args = vec!["--bind-addr=127.0.0.1:12345".to_string()];
+        let config = AppConfig::from_args_and_env(&args, |name| match name {
+            "GANTRY_BIND_ADDR" => Some("127.0.0.1:1111".to_string()),
+            "GANTRY_BIND_UDS" => Some("/tmp/ignored.sock".to_string()),
+            _ => None,
+        })
+        .expect("CLI TCP selection overrides both environment values");
+        assert_eq!(
+            config.bind_addr,
+            Some("127.0.0.1:12345".parse().expect("address"))
+        );
+        assert_eq!(config.bind_uds, None);
+    }
+
+    #[test]
+    fn cli_rejects_listener_flag_conflicts_unknown_flags_and_invalid_backends() {
+        let both = vec![
+            "--bind-addr".to_string(),
+            "127.0.0.1:8000".to_string(),
+            "--bind-uds".to_string(),
+            "/tmp/gantry.sock".to_string(),
+        ];
+        assert!(matches!(
+            AppConfig::from_args_and_env(&both, |_| None),
+            Err(ConfigError::ConflictingBindTargets)
+        ));
+        assert!(matches!(
+            AppConfig::from_args_and_env(&["--unknown".to_string()], |_| None),
+            Err(ConfigError::UnknownArgument(_))
+        ));
+        assert!(matches!(
+            AppConfig::from_args_and_env(
+                &["--backend".to_string(), "fallback".to_string()],
+                |_| None
+            ),
+            Err(ConfigError::InvalidBackend { .. })
+        ));
+    }
+
+    #[test]
+    fn policy_cli_precedence_backend_default_and_legacy_environment_migration() {
+        let config = AppConfig::from_args_and_env(&[], |name| match name {
+            "MCP_BIND_ADDR" => Some("0.0.0.0:3000".to_string()),
+            "MCP_BIND_UDS" => Some("/tmp/old.sock".to_string()),
+            "POLICY_DIR" => Some("/old/policies".to_string()),
+            "GANTRY_BACKEND" => Some("bubblewrap".to_string()),
+            _ => None,
+        })
+        .expect("legacy server variables are ignored");
+        assert_eq!(
+            config.bind_addr,
+            Some(DEFAULT_BIND_ADDR.parse().expect("default address"))
+        );
+        assert_eq!(config.bind_uds, None);
+        assert_eq!(config.policy_dir, None);
+        assert_eq!(config.backend, ExecutionBackend::Direct);
+
+        let args = vec![
+            "--policy-dir".to_string(),
+            "/cli/policies".to_string(),
+            "--backend=bubblewrap".to_string(),
+        ];
+        let config = AppConfig::from_args_and_env(&args, |name| match name {
+            "GANTRY_POLICY_DIR" => Some("/env/policies".to_string()),
+            _ => None,
+        })
+        .expect("CLI policy/backend values accepted");
+        assert_eq!(config.policy_dir, Some(PathBuf::from("/cli/policies")));
+        assert_eq!(config.backend, ExecutionBackend::Bubblewrap);
+    }
+
+    #[test]
+    fn gantry_environment_names_configure_server_and_backend_has_no_environment_alias() {
+        let config = AppConfig::from_env_with(|name| match name {
+            "GANTRY_BIND_ADDR" => Some("0.0.0.0:3000".to_string()),
+            "GANTRY_POLICY_DIR" => Some("/env/policies".to_string()),
+            "GANTRY_BACKEND" => Some("bubblewrap".to_string()),
+            _ => None,
+        })
+        .expect("valid GANTRY server environment");
+        assert_eq!(
+            config.bind_addr,
+            Some("0.0.0.0:3000".parse().expect("address"))
+        );
+        assert_eq!(config.policy_dir, Some(PathBuf::from("/env/policies")));
+        assert_eq!(config.backend, ExecutionBackend::Direct);
+    }
+
     #[tokio::test]
     async fn serve_rejects_existing_non_socket_path() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -423,6 +641,7 @@ mod tests {
             bind_addr: None,
             bind_uds: Some(socket_path.clone()),
             policy_dir: None,
+            backend: ExecutionBackend::Direct,
             default_cwd: std::env::current_dir().expect("current dir"),
         };
 
@@ -518,6 +737,9 @@ mod tests {
         assert!(check_typed.resolved_path.is_some());
         assert!(check_typed.hash.is_some());
         assert_eq!(check_typed.cwd.as_deref(), Some(expected_cwd.as_str()));
+        assert_eq!(check_typed.filesystem, None);
+        assert_eq!(check_typed.baffle_session, None);
+        assert_eq!(check_typed.backend, "direct");
 
         client.cancel().await.expect("cancel client");
         server_task.abort();

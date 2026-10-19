@@ -798,6 +798,9 @@ mod tests {
                     hash: Some("abc".to_string()),
                     cwd: Some("/work".to_string()),
                     policy_mode: "rego".to_string(),
+                    filesystem: Some("workspace-readonly".to_string()),
+                    baffle_session: Some("github-readonly.toml".to_string()),
+                    backend: "bubblewrap".to_string(),
                 }),
             )
                 .into_response()
@@ -849,6 +852,12 @@ mod tests {
         assert_eq!(decision.executable, "echo");
         assert_eq!(decision.cwd.as_deref(), Some("/work"));
         assert_eq!(decision.policy_mode, "rego");
+        assert_eq!(decision.filesystem.as_deref(), Some("workspace-readonly"));
+        assert_eq!(
+            decision.baffle_session.as_deref(),
+            Some("github-readonly.toml")
+        );
+        assert_eq!(decision.backend, "bubblewrap");
 
         server_task.abort();
     }
@@ -868,6 +877,9 @@ mod tests {
                     hash: Some("deadbeef".to_string()),
                     cwd: Some("/work".to_string()),
                     policy_mode: "rego".to_string(),
+                    filesystem: None,
+                    baffle_session: None,
+                    backend: "direct".to_string(),
                 }),
             )
                 .into_response()
@@ -918,6 +930,9 @@ mod tests {
                     hash: Some("abc".to_string()),
                     cwd: Some("/work".to_string()),
                     policy_mode: "rego".to_string(),
+                    filesystem: Some("workspace-write".to_string()),
+                    baffle_session: None,
+                    backend: "bubblewrap".to_string(),
                 }),
             )
                 .into_response()
@@ -1040,6 +1055,9 @@ mod tests {
                     hash: Some("abc".to_string()),
                     cwd: Some("/work".to_string()),
                     policy_mode: "rego".to_string(),
+                    filesystem: None,
+                    baffle_session: None,
+                    backend: "direct".to_string(),
                 }),
             )
                 .into_response()

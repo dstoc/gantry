@@ -226,10 +226,12 @@ size = "256MiB"
 
 A writable profile can specify `access = "read-write"`. Paths are absolute **within the trusted Gantry runtime**, not necessarily on the physical host. No untrusted caller or Rego expression may supply or override source paths, destinations, or access modes; Rego selects only the profile name.
 
+When `--policy-dir` points to `config/policies`, Gantry reads profiles from its sibling `config/filesystems` directory. Each profile is a direct `<name>.toml` file with `version = 1`. Names use lowercase ASCII letters, digits, hyphens, and underscores. Bind sources must exist and resolve through non-symlink regular files or directories. Bind access is exactly `read-only` or `read-write`. Tmpfs sizes use positive `B`, `KiB`, `MiB`, or `GiB` values. Destinations cannot contain traversal components, overlap each other, or shadow protected runtime paths.
+
 ### Path validation and mount safety
 
 - Parse profiles only from administrator-controlled files.
-- Resolve source paths in trusted code; reject traversal, symlink races, unsafe file types, conflicting targets and protected-target shadowing.
+- Resolve source paths in trusted code; reject traversal, symlink components, unsafe file types, conflicting targets and protected-target shadowing. Phase 1 validates profile paths; Phase 2 pins the source objects before applying mounts.
 - Pin opened source objects before applying mounts, preferably with Bubblewrap's descriptor-based `--bind-fd`/`--ro-bind-fd` (where available) or another race-resistant equivalent. Validate backend version and required capabilities; fail closed if unavailable.
 - Read-only mounts constrain writes *from the command* but do not freeze changes by other processes. Consider nested mounts and unintended writable submounts.
 - Filesystem profiles are **allowlists**; they are not mounted on top of an inherited unrestricted root filesystem.
@@ -265,6 +267,8 @@ The Rego decision's `baffle_session` is either `null` (no managed Baffle session
 ```
 
 This is a Baffle **session configuration filename**, not the runtime-generated Baffle session ID or socket path. Gantry validates the name and Baffle performs its file-only ownership, symlink and contents checks when creating the session. The filename comes from Rego, never the untrusted command request.
+
+Gantry accepts only a single `.toml` filename with an ASCII letter or digit followed by ASCII letters, digits, hyphens, or underscores. It does not read or reload Baffle configuration contents.
 
 Example Baffle configuration:
 
@@ -464,14 +468,14 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 
 **Code locations:** `src/main.rs`, `src/mcp.rs` (move config parsing into `src/config.rs` if useful), `src/policy.rs`, `src/executor.rs`, plus new `src/filesystem.rs` and `src/execution.rs`.
 
-1. **Server arguments/config:** Implement `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend` with `clap` or an equivalently tested parser. Default backend is Bubblewrap. Read only `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`; remove legacy environment lookups and update errors, README, and MCP instructions. Apply the CLI-over-environment listener precedence specified above, and reject invalid/dual bind flags.
+1. **Server arguments/config:** Implement `--bind-addr`, `--bind-uds`, `--policy-dir`, and `--backend` with `clap` or an equivalently tested parser. Read only `GANTRY_BIND_ADDR`, `GANTRY_BIND_UDS`, and `GANTRY_POLICY_DIR`; remove legacy environment lookups and update errors, README, and MCP instructions. Apply the CLI-over-environment listener precedence specified above, and reject invalid/dual bind flags. Keep Direct as the Phase 1 runtime default because Bubblewrap execution is not implemented until Phase 2. Accept an explicit Bubblewrap selection for check planning, but fail execution closed until that backend exists; do not substitute Direct. Phase 2 changes the runtime default to Bubblewrap.
 2. **Structured Rego result:** Replace `data.sandbox.main.allow` with `data.sandbox.main.decision` in `src/policy.rs`. Deserialize to a typed `PolicyDecision { allow, filesystem, baffle_session }`. For `allow: true`, require both profile fields to be **present** (an explicit `null` differs from a missing field); reject wrong types, conflicting/undefined results and invalid names. Preserve the existing command path, SHA-256, args, forwarded-env and trusted-CWD input. Retain deny-all on failed policy load/reload.
 3. **Profile loader:** Read administrator-controlled `filesystems/*.toml` into a typed mount profile model using the schema in §2. Validate required fields, duplicate/overlapping destinations, RO/RW access, tmpfs sizes, protected destinations, and absolute source/target paths. Profiles contain direct paths; do not introduce a named-resource registry. Resolve the selected profile only when required by Bubblewrap.
 4. **Consistent reload generation:** Publish the compiled Rego policy and validated filesystem profiles together as one immutable generation. On reload, construct and validate the whole generation before swapping it; if compilation/validation fails, use the existing deny-all behavior. An execution retains the generation used for its authorization and profile resolution. Baffle filenames remain references to daemon-managed files, not contents loaded into Gantry.
 5. **Authorized plan:** Split `authorize_command_request` in `src/executor.rs` into reusable authorization and execution steps. Build a typed `AuthorizedInvocation` with the already-resolved absolute executable path, exact args, effective env, authorized CWD path and policy generation; attach a validated profile and optional Baffle filename for Bubblewrap. The backend is **fixed by startup config**, not by Rego. Validate compatibility: Direct requires both fields `null`, Bubblewrap requires a named filesystem profile.
 6. **Side-effect-free checks:** Extend `RunCommandCheckOutput` and `check_command` to report `filesystem`, `baffle_session`, and the configured `backend`, including a useful denial reason for incompatible combinations. `/check` must not start subprocesses, mount anything or create Baffle leases. Preserve the existing public command request schema.
 
-**Tests:** CLI/environment precedence, bind target conflicts, old variables ignored, default backend, Rego result shapes and conflict handling, profile parsing and invalid mounts, backend compatibility matrix, reload atomicity and deny-all, and `/check` with no side effects.
+**Tests:** CLI/environment precedence, bind target conflicts, old variables ignored, Phase 1 Direct default, Rego result shapes and conflict handling, profile parsing and invalid mounts, backend compatibility matrix, reload atomicity and deny-all, and `/check` with no side effects.
 
 **Phase gate:** All combinations of Rego profiles and the configured backend can be checked and resolved into a validated plan, without launching a sandbox. When splitting work into separate PRs, do not switch the runtime default to Bubblewrap until Phase 2 actually implements it.
 
@@ -522,7 +526,7 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
 4. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
 5. **Process-tree termination:** Are PID namespaces plus supervisor signalling sufficient for all supported environments, or does Gantry additionally require cgroups or another reaper mechanism?
-6. **Profile configuration and reload:** Finalize direct-path TOML schema, Baffle filename rules, reload consistency, and explicit migration from the legacy boolean policy.
+6. **Profile configuration and reload:** Phase 1 resolves profile and migration choices: TOML profiles use the sibling `filesystems/` directory, version 1, strict direct paths, and a SHA-256 fingerprint across Rego and profile contents; each valid reload publishes both together. Baffle selections are single `.toml` filenames whose contents remain daemon-managed. Existing boolean policies require migration to `data.sandbox.main.decision`. Phase 2 must still choose descriptor-based mount operations for the validated sources.
 7. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
 
 ## Final acceptance criteria

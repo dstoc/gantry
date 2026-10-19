@@ -8,7 +8,7 @@ It exposes three HTTP endpoints on one server:
 - `/raw`: NDJSON streaming endpoint for direct command execution
 - `/check`: JSON policy-check endpoint that returns a decision object
 
-Policy decisions are made by [Rego](https://www.openpolicyagent.org/docs/policy-reference) modules loaded from `POLICY_DIR`.
+Policy decisions are made by [Rego](https://www.openpolicyagent.org/docs/policy-reference) modules loaded from `GANTRY_POLICY_DIR`. Administrator-controlled filesystem profiles load from the sibling `filesystems/` directory.
 
 ## Security Model
 
@@ -35,26 +35,37 @@ Policy checks are advisory and point-in-time:
 
 ## Configuration
 
-Environment variables:
+Server options and their environment variables:
 
-- `MCP_BIND_ADDR` (optional): bind address, default `127.0.0.1:8000`
-- `MCP_BIND_UDS` (optional): absolute Unix socket path; when set, `gantry` binds the same `/mcp`, `/raw`, and `/check` app to that socket
-- `POLICY_DIR` (recommended): directory containing `.rego` policy files
+- `--bind-addr HOST:PORT` or `GANTRY_BIND_ADDR`: TCP listener, default `127.0.0.1:8000`
+- `--bind-uds ABSOLUTE_PATH` or `GANTRY_BIND_UDS`: Unix socket listener
+- `--policy-dir PATH` or `GANTRY_POLICY_DIR`: directory containing `.rego` policy files
+- `--backend bubblewrap|direct`: select the server's execution backend
 
-Example:
+Command-line values take precedence over environment values. A listener flag selects that listener and ignores both listener environment variables. Without a listener flag, set at most one listener environment variable. If neither is set, Gantry uses TCP on `127.0.0.1:8000`. `--bind-addr` and `--bind-uds` cannot both be supplied.
+
+The old server variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` are ignored. The `run-remote` client variables `RUN_REMOTE_SERVER` and `RUN_REMOTE_SOCKET` are unchanged.
+
+Phase 1 keeps Direct as the default so existing deployments retain their working execution path. A selected Bubblewrap plan can be checked, but command execution with `--backend bubblewrap` fails closed until Phase 2 implements that backend. Gantry never reports or runs Direct as Bubblewrap. Phase 2 will change the runtime default to Bubblewrap.
+
+Examples:
 
 ```bash
-export MCP_BIND_ADDR=0.0.0.0:3000
-export POLICY_DIR=/opt/config/nw_sandbox
-gantry
+GANTRY_BIND_ADDR=0.0.0.0:3000 GANTRY_POLICY_DIR=/opt/config/policies gantry
+gantry --bind-addr 127.0.0.1:8000 --policy-dir /opt/config/policies
+gantry --bind-uds /run/gantry/gantry.sock --policy-dir /opt/config/policies
+gantry --backend bubblewrap --policy-dir /opt/config/policies
+gantry --backend direct --policy-dir /opt/config/direct-policies
 ```
 
-Unix socket example:
+When `GANTRY_POLICY_DIR=/etc/gantry/policies`, place filesystem profiles in `/etc/gantry/filesystems`:
 
-```bash
-export MCP_BIND_UDS=/tmp/gantry.sock
-export POLICY_DIR=/opt/config/nw_sandbox
-gantry
+```text
+/etc/gantry/
+  policies/
+    main.rego
+  filesystems/
+    workspace-readonly.toml
 ```
 
 ## Build and Run
@@ -100,38 +111,60 @@ nw_sandbox/
   toolx_segments.rego
 ```
 
-## Decision Contract
+## Structured Decision Contract
 
-`gantry` evaluates this Rego query:
-
-```text
-data.sandbox.main.allow
-```
-
-Your modules should produce a single boolean `allow` decision.
-
-The same input and authorization path are used by `check_command`, `POST /check`, and `run-remote --check`.
-
-Router pattern (recommended):
+`gantry` evaluates `data.sandbox.main.decision`. Every allowed decision must set all three fields. Use explicit `null` values when the policy does not select a filesystem profile or Baffle session. Missing fields do not mean `null`.
 
 ```rego
 package sandbox.main
 
-default allow = false
-
-allow if {
-    data.sandbox[input.command].allow
-    env_allowed
+default decision := {
+    "allow": false,
+    "filesystem": null,
+    "baffle_session": null,
 }
 
-env_allowed if {
+decision := {
+    "allow": true,
+    "filesystem": null,
+    "baffle_session": null,
+} if {
+    data.sandbox[input.command].allow
     count(object.keys(input.env)) == 0
 }
-
-env_allowed if {
-    data.sandbox[input.command].allow_env
-}
 ```
+
+The same input and authorization path are used by `check_command`, `POST /check`, and `run-remote --check`.
+
+The startup-selected backend is not a Rego field. Direct requires both selection fields to be `null`. Bubblewrap requires a configured filesystem profile and accepts either a `null` Baffle selection or a Baffle configuration filename. Undefined, conflicting, malformed, and backend-incompatible decisions deny execution.
+
+Checks include the selected `filesystem`, `baffle_session`, and configured `backend`. A check validates policy and profile selection; it does not spawn a command, mount a filesystem, or create a Baffle session.
+
+### Filesystem Profiles
+
+Profiles are TOML files named `<profile>.toml` in the sibling `filesystems/` directory. A profile has `version = 1` and direct source and destination paths. Profile names use lowercase letters, digits, hyphens, and underscores. Bind sources must be absolute paths to regular files or directories. Destinations must be absolute and cannot contain traversal components, overlap another mount, or shadow protected system paths.
+
+```toml
+version = 1
+
+[[mounts]]
+source = "/srv/workspace"
+target = "/workspace"
+access = "read-only"
+
+[[mounts]]
+type = "tmpfs"
+target = "/tmp"
+size = "256MiB"
+```
+
+Bind access must be `read-only` or `read-write`. Tmpfs sizes must be positive and use `B`, `KiB`, `MiB`, or `GiB`. Profiles are administrator-controlled; Rego selects a profile name and cannot choose mount paths or access.
+
+### Migrating from the Boolean Contract
+
+Replace `data.sandbox.main.allow` with `data.sandbox.main.decision`. A Direct deployment returns explicit `filesystem: null` and `baffle_session: null` fields, and uses `--backend direct` when selecting the backend explicitly. Bubblewrap policies select a named profile from the administrator-managed `filesystems/` directory.
+
+Command-specific `data.sandbox[...].allow` rules can remain as rules inside the router policy. The router must return the structured decision object above.
 
 ## Rego Examples
 
@@ -396,18 +429,18 @@ The JSON decision object is written to stdout.
 
 ## Live Reload Behavior
 
-When `POLICY_DIR` is set, `gantry` watches the directory recursively.
+When `GANTRY_POLICY_DIR` is set, `gantry` checks Rego files and the sibling `filesystems/*.toml` profiles for changes.
 
-- valid edit -> new policy set becomes active
-- invalid edit -> deny-all becomes active
-- subsequent valid edit -> service recovers automatically
+- valid policy/profile changes -> a new combined generation becomes active
+- invalid policy or profile change -> deny-all becomes active
+- subsequent valid changes -> service recovers automatically
 
-This lets operators update policy without restarting the process.
+Each authorized plan retains the generation used for its decision and profile selection.
 
 ## Troubleshooting
 
 - `Command not allowed: <cmd>`
-  - `data.sandbox.main.allow` evaluated to `false`
+  - `data.sandbox.main.decision` returned `allow: false`
   - verify router and command package names match `input.command`
 - `Policy deny-all is active: ...`
   - policy set failed to compile/load
