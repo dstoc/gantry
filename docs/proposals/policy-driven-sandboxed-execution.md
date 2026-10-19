@@ -224,7 +224,7 @@ A selected profile adds only its declared direct-path mounts to that baseline. I
 
 **Baffle is the only network integration in scope.** There is no general network-provider abstraction and no Gantry network-profile mapping layer.
 
-The Rego decision's `baffle_session` is either `null` (no network) or a filename relative to Baffle's administrator-controlled `session_config_dir`:
+The Rego decision's `baffle_session` is either `null` (no managed Baffle session) or a filename relative to Baffle's administrator-controlled `session_config_dir`. Direct requires `null`:
 
 ```json
 {
