@@ -133,10 +133,10 @@ decision := {
 | Field | Type | Contract |
 | --- | --- | --- |
 | `allow` | boolean | Required; only `true` permits execution. |
-| `filesystem` | string or null | Required; a named profile selects Bubblewrap, `null` selects Direct (only if explicitly enabled in trusted configuration). |
-| `baffle_session` | string or null | Required; with Bubblewrap, `null` means no external network; a filename selects a Baffle session relative to `session_config_dir`. Direct requires `null`, but still inherits ambient network access. |
+| `filesystem` | string or null | Required; a named profile is required under Bubblewrap; `null` is required under Direct. Does not select the backend. |
+| `baffle_session` | string or null | Required; with Bubblewrap, `null` denies external network and a filename selects Baffle; Direct requires `null` and retains ambient network access. |
 
-For a denied decision, only `allow: false` has effect. For an allowed decision, an invalid named filesystem profile, malformed Baffle filename, undefined result, malformed type or conflicting decisions must deny execution. **`filesystem: null` explicitly requests Direct, and requires both the trusted Direct-enable setting and `baffle_session: null`.** A named profile requests Bubblewrap; if Bubblewrap cannot enforce it, fail rather than execute directly. `baffle_session: null` provides network isolation **only with Bubblewrap**.
+For a denied decision, only `allow: false` has effect. For an allowed decision, an invalid named filesystem profile, malformed Baffle filename, undefined result, malformed type or conflicting decisions must deny execution. **The `--backend` CLI flag selects the backend, not these fields.** Direct requires `filesystem: null` and `baffle_session: null`; Bubblewrap requires a named filesystem profile. Any incompatible combination is an authorization/validation error; never change backends implicitly. `baffle_session: null` provides network isolation **only with Bubblewrap**.
 
 Evaluate authorization and profile selection together, not as unrelated queries against potentially different policy generations. Preserve command-specific `data.sandbox[...].allow` modules where useful by adapting the router policy. Retaining `sandbox` avoids coupling this change to an unrelated Rego package rename; changing the package name can be a separate migration.
 
@@ -156,7 +156,7 @@ Rego must not return raw filesystem paths, mount flags, Baffle credentials, or r
 }
 ```
 
-A check validates the selected backend, including whether Direct is enabled and the `filesystem`/`baffle_session` combination is permitted. It may validate filesystem-profile existence/schema and Baffle filename syntax, but **must not** create a Baffle session, mount filesystems or spawn either backend. It remains advisory and point-in-time: the real execution reauthorizes and may fail during provisioning. Explicitly document migration from the current boolean `allow` contract. A compatibility mode, if offered, must not imply an unrestricted filesystem by default.
+A check reports the startup-selected backend and validates the `filesystem`/`baffle_session` combination against it. It may validate filesystem-profile existence/schema and Baffle filename syntax, but **must not** create a Baffle session, mount filesystems or spawn either backend. It remains advisory and point-in-time: the real execution reauthorizes and may fail during provisioning. Explicitly document migration from the current boolean `allow` contract. A compatibility mode, if offered, must not imply an unrestricted filesystem by default.
 
 ## 2. Filesystem policies with direct source paths
 
@@ -274,7 +274,7 @@ trait ExecutionBackend {
 
 `RunningExecution` supports streamed output, exit status, cancellation and cleanup. Exact Rust type and ownership details are implementation decisions; the important property is **no orphaned process tree or leaked Baffle lease** when the caller disconnects or execution fails.
 
-The filesystem decision selects the backend: a named filesystem profile selects Bubblewrap, while `filesystem: null` selects Direct when enabled by trusted Gantry configuration. Direct keeps the current `tokio::process::Command` behavior. Future backends may implement named profiles, but failed Bubblewrap execution never falls back to Direct.
+The `--backend` startup option selects the backend for the Gantry instance; default `bubblewrap`, explicit opt-in `direct`. Rego never selects it. Direct keeps the current `tokio::process::Command` behavior. Unsupported policy requirements cause an error, and failed Bubblewrap execution never falls back to Direct.
 
 ### Backend selection matrix
 
@@ -293,9 +293,9 @@ Use capability validation before provisioning. Concurrent runs must each retain 
 
 Direct preserves the current Gantry execution path: after authorization, spawn the resolved executable using `tokio::process::Command` with its authorized arguments, environment and CWD. Keep existing stdio, streaming, exit and cancellation behavior.
 
-Direct does not use Bubblewrap, a per-command filesystem policy, a supervisor, a Baffle lease or a command-local bridge. It inherits Gantry's filesystem and network environment, including any existing proxy configuration. Only an explicit `filesystem: null`, `baffle_session: null` decision may select it, and only if Direct is enabled in trusted configuration.
+Direct does not use Bubblewrap, a per-command filesystem policy, a supervisor, a Baffle lease or a command-local bridge. It inherits Gantry's filesystem and network environment, including any existing proxy configuration. Only explicit `--backend direct` selects it; its policy decision must contain `filesystem: null` and `baffle_session: null`.
 
-A missing/invalid filesystem field must not select Direct. A failed Bubblewrap execution must not retry through Direct.
+A missing/invalid filesystem field is an error regardless of the selected backend. A failed Bubblewrap execution must not retry through Direct.
 
 ## 5. Bubblewrap backend
 
@@ -397,7 +397,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Network | Bubblewrap with `baffle_session: null` has no external network; Baffle session rules remain enforced; Direct inherits Gantry networking and requires a null Baffle selection. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
-| Direct | Explicit null filesystem and null Baffle session use existing execution. Verify Direct-disabled and incompatible Baffle decisions are rejected, and Bubblewrap failures do not select Direct. |
+| Backend selection | Without a flag, Bubblewrap is selected; `--backend direct` runs existing execution only for both-null policy fields. Verify incompatible combinations fail and Bubblewrap errors never trigger Direct. |
 | Compatibility | Bubblewrap in supported Linux environments and rootless containers; namespace capability and live pathname UDS mount spike before dependent work. |
 
 Include negative tests that deliberately attempt to connect to the parent proxy listener, open other Baffle session sockets, access protected filesystem paths, and use direct TCP egress.
