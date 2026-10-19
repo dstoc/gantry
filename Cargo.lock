@@ -178,8 +178,9 @@ dependencies = [
 
 [[package]]
 name = "baffle-client"
-version = "1.1.1"
-source = "git+https://github.com/dstoc/baffle?rev=c99af79a51089555896648dd3307b96fecd1d0db#c99af79a51089555896648dd3307b96fecd1d0db"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68d3c8a72b9819bc158ad7ce0a51f870d6c36a1a1e358a225b2f403efaa7d3fc"
 dependencies = [
  "libc",
  "serde",
@@ -733,6 +734,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

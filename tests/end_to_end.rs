@@ -210,6 +210,9 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
     let session_path = socket_dir.join("phase4-session.sock");
     let control_listener = UnixListener::bind(&control_path).expect("mock Baffle control socket");
     let _session_listener = UnixListener::bind(&session_path).expect("mock Baffle data socket");
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .expect("generate Baffle CA fixture");
+    let ca_certificate_pem = certificate.cert.pem();
     let (lease_closed_tx, lease_closed_rx) = tokio::sync::oneshot::channel();
     let session_path_response = session_path.clone();
     let daemon = tokio::spawn(async move {
@@ -229,6 +232,7 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
             .expect("read create request");
         let request = String::from_utf8(request).expect("request TOML");
         assert!(request.contains("operation = \"create_from_file\""));
+        assert!(request.contains("require_ephemeral = true"));
         assert!(request.contains("name = \"diagnostics.toml\""));
         let response = serde_json::to_vec(&serde_json::json!({
             "version": 2,
@@ -236,7 +240,8 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
             "result": {
                 "id": "phase4-session-safe",
                 "socket": session_path_response,
-                "persistent": false
+                "persistent": false,
+                "ca_certificate_pem": ca_certificate_pem
             }
         }))
         .expect("mock Baffle response JSON");
@@ -255,10 +260,6 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
             .expect("report Baffle lease release");
     });
 
-    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("generate Baffle CA fixture");
-    let ca_path = root.path().join("ca.pem");
-    fs::write(&ca_path, certificate.cert.pem()).expect("write Baffle CA fixture");
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("reserve TCP address");
@@ -272,8 +273,6 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
         .arg(&policies)
         .args(["--backend", "bubblewrap"])
         .env("GANTRY_BAFFLE_CONTROL_SOCKET", &control_path)
-        .env("GANTRY_BAFFLE_SESSION_SOCKET_DIR", &socket_dir)
-        .env("GANTRY_BAFFLE_CA_CERT", &ca_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -304,9 +303,13 @@ async fn baffle_diagnostics_report_session_identity_without_request_secrets() {
         }))
         .send()
         .await
-        .expect("start Baffle command")
-        .error_for_status()
-        .expect("Baffle raw response");
+        .expect("start Baffle command");
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.expect("read Baffle error response");
+        let logs = String::from_utf8_lossy(&server.stop()).into_owned();
+        panic!("Baffle command failed with {status}: {body}\nGantry logs:\n{logs}");
+    }
     let events = response
         .bytes()
         .await

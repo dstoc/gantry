@@ -34,9 +34,8 @@ Direct execution changes CWD through the directory opened during authorization.
 The run-remote client keeps RUN_REMOTE_SERVER and RUN_REMOTE_SOCKET.
 
 Baffle settings:
-  GANTRY_BAFFLE_CONTROL_SOCKET
-  GANTRY_BAFFLE_SESSION_SOCKET_DIR
-  GANTRY_BAFFLE_CA_CERT"
+  GANTRY_BAFFLE_CONTROL_SOCKET (default: Baffle's platform path)
+Baffle file-backed sessions require daemon release 2.0.0 or later."
         );
         return Ok(());
     }

@@ -29,7 +29,6 @@ struct BaffleDaemon {
     child: Child,
     control_socket: PathBuf,
     session_socket_dir: PathBuf,
-    ca_certificate: PathBuf,
     daemon_log: PathBuf,
 }
 
@@ -74,8 +73,6 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
     let daemon = start_baffle_daemon(&binary, directory.path(), &upstream_ca);
     let baffle = BaffleRuntimeConfig {
         control_socket: daemon.control_socket.clone(),
-        session_socket_dir: daemon.session_socket_dir.clone(),
-        ca_certificate: Some(daemon.ca_certificate.clone()),
     };
 
     write_session_file(
@@ -192,7 +189,7 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
     // Baffle control socket, its directory, another session, and the key stay
     // at their host paths and must not appear in the command's filesystem.
     let other_lease = client
-        .create_from_file("path-a.toml")
+        .create_ephemeral_from_file("path-a.toml")
         .await
         .expect("create another active session for the visibility check");
     let other_socket = other_lease.socket_path().to_path_buf();
@@ -351,6 +348,66 @@ async fn bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions() {
 }
 
 #[tokio::test]
+async fn daemon_rejects_persistent_file_sessions_before_provisioning() {
+    if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_none() {
+        eprintln!(
+            "skipping persistent Baffle rejection test: required Bubblewrap tests are disabled"
+        );
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() && !Path::new("/bin/bwrap").is_file() {
+        panic!("Bubblewrap is required for persistent Baffle rejection coverage");
+    }
+
+    let directory = tempfile::tempdir_in("/dev/shm").expect("persistent Baffle fixture");
+    let _origin = start_https_origin(directory.path()).await;
+    let upstream_ca = directory.path().join("upstream-ca.pem");
+    let binary = PathBuf::from(
+        std::env::var_os("GANTRY_BAFFLE_TEST_BINARY").expect("required Baffle daemon fixture"),
+    );
+    let daemon = start_baffle_daemon(&binary, directory.path(), &upstream_ca);
+    write_persistent_session_file(directory.path(), "persistent.toml", 443);
+    let executable = Path::new("/usr/bin/true");
+    let policy = policy_engine(
+        &directory.path().join("persistent-policy"),
+        executable,
+        Some("persistent.toml"),
+    );
+
+    let error = run_command_with_baffle_config(
+        &policy,
+        Path::new("/"),
+        ExecutionBackend::Bubblewrap,
+        BaffleRuntimeConfig {
+            control_socket: daemon.control_socket.clone(),
+        },
+        RunCommandInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: Some("/".into()),
+            env: None,
+        },
+    )
+    .await
+    .expect_err("persistent Baffle config must be rejected before command startup");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to create Baffle session"),
+        "unexpected error: {error}"
+    );
+    let sessions = Client::new(&daemon.control_socket)
+        .list()
+        .await
+        .expect("query sessions after persistent rejection");
+    assert!(
+        sessions.is_empty(),
+        "daemon must reject the persistent configuration before provisioning"
+    );
+    drop(daemon);
+}
+
+#[tokio::test]
 async fn bubblewrap_mounts_a_mock_file_only_baffle_uds_and_releases_its_lease() {
     if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_none() {
         eprintln!("skipping mock Baffle UDS mount: required Bubblewrap tests are disabled");
@@ -374,8 +431,6 @@ async fn baffle_creation_failure_prevents_command_start() {
     }
 
     let directory = tempfile::tempdir_in("/dev/shm").expect("temporary fixture directory");
-    let socket_dir = directory.path().join("proxies");
-    fs::create_dir_all(&socket_dir).expect("Baffle socket directory");
     let control_path = directory.path().join("control.sock");
     let control_listener =
         tokio::net::UnixListener::bind(&control_path).expect("mock Baffle control socket");
@@ -396,6 +451,7 @@ async fn baffle_creation_failure_prevents_command_start() {
             .expect("read Baffle request");
         let request = String::from_utf8(request).expect("Baffle request is UTF-8");
         assert!(request.contains("operation = \"create_from_file\""));
+        assert!(request.contains("require_ephemeral = true"));
         assert!(request.contains("name = \"unavailable.toml\""));
 
         let response = serde_json::to_vec(&serde_json::json!({
@@ -417,12 +473,6 @@ async fn baffle_creation_failure_prevents_command_start() {
             .expect("write Baffle error response");
     });
 
-    let ca_certificate = directory.path().join("ca.pem");
-    fs::write(
-        &ca_certificate,
-        "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
-    )
-    .expect("write public certificate fixture");
     let executable = Path::new("/usr/bin/true");
     let policy = policy_engine(directory.path(), executable, Some("unavailable.toml"));
     let error = run_command_with_baffle_config(
@@ -431,8 +481,6 @@ async fn baffle_creation_failure_prevents_command_start() {
         ExecutionBackend::Bubblewrap,
         BaffleRuntimeConfig {
             control_socket: control_path,
-            session_socket_dir: socket_dir,
-            ca_certificate: Some(ca_certificate),
         },
         RunCommandInput {
             executable: executable.to_string_lossy().into_owned(),
@@ -483,6 +531,7 @@ async fn run_mock_uds_mount(root: &Path) {
             .expect("read create_from_file request");
         let request = String::from_utf8(request).expect("request is UTF-8 TOML");
         assert!(request.contains("operation = \"create_from_file\""));
+        assert!(request.contains("require_ephemeral = true"));
         assert!(request.contains("name = \"mock.toml\""));
 
         let response = serde_json::to_vec(&serde_json::json!({
@@ -491,7 +540,8 @@ async fn run_mock_uds_mount(root: &Path) {
             "result": {
                 "id": "mock-session",
                 "socket": response_socket,
-                "persistent": false
+                "persistent": false,
+                "ca_certificate_pem": test_ca_certificate_pem()
             }
         }))
         .expect("mock response JSON");
@@ -531,12 +581,6 @@ async fn run_mock_uds_mount(root: &Path) {
             .expect("write mock proxy response");
     });
 
-    let ca_certificate = mock_root.join("ca.pem");
-    fs::write(
-        &ca_certificate,
-        "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
-    )
-    .expect("write mock public certificate");
     let policy = policy_engine(root, Path::new("/usr/bin/curl"), Some("mock.toml"));
     let output = run_command_with_baffle_config(
         &policy,
@@ -544,8 +588,6 @@ async fn run_mock_uds_mount(root: &Path) {
         ExecutionBackend::Bubblewrap,
         BaffleRuntimeConfig {
             control_socket: control_path,
-            session_socket_dir: socket_dir,
-            ca_certificate: Some(ca_certificate),
         },
         RunCommandInput {
             executable: "/usr/bin/curl".into(),
@@ -652,10 +694,19 @@ fn write_session_file(root: &Path, filename: &str, port: u16, allowed_paths: &[&
     .expect("session file");
 }
 
+fn write_persistent_session_file(root: &Path, filename: &str, port: u16) {
+    write_session_file(root, filename, port, &["/persistent"]);
+    let path = root.join("baffle/sessions").join(filename);
+    let contents = fs::read_to_string(&path)
+        .expect("read ephemeral Baffle fixture before setting persistence")
+        .replace("persistent = false", "persistent = true");
+    fs::write(path, contents).expect("write persistent Baffle fixture");
+}
+
 fn start_baffle_daemon(binary: &Path, root: &Path, upstream_ca: &Path) -> BaffleDaemon {
     let baffle_root = root.join("baffle");
     let run_dir = baffle_root.join("run");
-    let socket_dir = baffle_root.join("proxies");
+    let socket_dir = baffle_root.join("private-data/non-default-proxies");
     let session_dir = baffle_root.join("sessions");
     let secrets_dir = baffle_root.join("secrets");
     fs::create_dir_all(&run_dir).expect("Baffle run directory");
@@ -668,6 +719,7 @@ fn start_baffle_daemon(binary: &Path, root: &Path, upstream_ca: &Path) -> Baffle
         for directory in [
             &baffle_root,
             &run_dir,
+            socket_dir.parent().expect("socket parent directory"),
             &socket_dir,
             &session_dir,
             &secrets_dir,
@@ -725,7 +777,6 @@ fn start_baffle_daemon(binary: &Path, root: &Path, upstream_ca: &Path) -> Baffle
         child,
         control_socket,
         session_socket_dir: socket_dir,
-        ca_certificate,
         daemon_log: daemon_log_path,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -868,4 +919,11 @@ async fn wait_for_sessions(client: &Client, expected: usize) -> Vec<baffle_clien
         );
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn test_ca_certificate_pem() -> String {
+    rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("test CA certificate")
+        .cert
+        .pem()
 }

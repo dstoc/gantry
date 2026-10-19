@@ -3,9 +3,10 @@ mod linux {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::fs;
-    use std::io;
+    use std::io::{self, Write};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
 
@@ -83,17 +84,6 @@ mod linux {
             .validate_profile_sources(profile, None)
             .map_err(StartError::Setup)?;
 
-        let ca_certificate = if plan.baffle_session.is_some() {
-            Some(
-                baffle
-                    .validate_for_session()
-                    .map_err(StartError::Setup)?
-                    .to_path_buf(),
-            )
-        } else {
-            None
-        };
-
         let mut runtime = runtime_files(&plan.invocation.executable, &supervisor, profile)
             .map_err(StartError::Setup)?;
         let supervisor_runtime = runtime
@@ -155,24 +145,8 @@ mod linux {
             });
         }
 
-        if let Some(ca_certificate) = ca_certificate.as_deref() {
-            let descriptor = open_pinned(ca_certificate, true).map_err(|error| {
-                StartError::Setup(format!(
-                    "failed to pin the configured public Baffle CA certificate: {error}"
-                ))
-            })?;
-            validate_public_ca_certificate(descriptor.as_raw_fd()).map_err(StartError::Setup)?;
-            let is_directory = descriptor_is_directory(descriptor.as_raw_fd())
-                .map_err(|error| StartError::Setup(error.to_string()))?;
-            mounts.push(PinnedMount {
-                target: PathBuf::from(SANDBOX_CA_CERTIFICATE),
-                kind: MountSourceKind::ReadOnly,
-                descriptor,
-                is_directory,
-            });
-        }
-
         let mut baffle_lease: Option<BaffleSessionLease> = None;
+        let mut baffle_trust_material = None;
         if let Some(filename) = plan.baffle_session.as_deref() {
             let lease = create_ephemeral_session(&baffle, filename)
                 .await
@@ -198,6 +172,16 @@ mod linux {
                 descriptor,
                 is_directory: false,
             });
+            let (certificate, trust_material) =
+                private_ca_certificate_file(lease.ca_certificate_pem())
+                    .map_err(StartError::Setup)?;
+            mounts.push(PinnedMount {
+                target: PathBuf::from(SANDBOX_CA_CERTIFICATE),
+                kind: MountSourceKind::ReadOnly,
+                descriptor: certificate,
+                is_directory: false,
+            });
+            baffle_trust_material = Some(trust_material);
             baffle_lease = Some(lease);
         }
 
@@ -332,6 +316,7 @@ mod linux {
                 ));
             }
         }
+        drop(baffle_trust_material);
 
         let baffle_session_id = execution.baffle_session_id().map(str::to_owned);
         tracing::debug!(
@@ -666,40 +651,30 @@ mod linux {
         Ok(stat.st_mode & libc::S_IFMT == libc::S_IFSOCK)
     }
 
-    fn validate_public_ca_certificate(fd: RawFd) -> Result<(), String> {
-        let contents = fs::read(format!("/proc/self/fd/{fd}")).map_err(|error| {
-            format!("failed to read the configured Baffle CA certificate: {error}")
-        })?;
-        let text = std::str::from_utf8(&contents)
-            .map_err(|_| "configured Baffle CA certificate is not UTF-8 PEM".to_string())?;
-        if text.contains("PRIVATE KEY") {
-            return Err(
-                "configured Baffle CA file contains private key material; only public certificates can be mounted".to_string(),
-            );
-        }
-
-        let mut remainder = text.trim();
-        let mut certificates = 0;
-        while !remainder.is_empty() {
-            let Some(block) = remainder.strip_prefix("-----BEGIN CERTIFICATE-----") else {
-                return Err(
-                    "configured Baffle CA file must contain only public certificate PEM blocks"
-                        .to_string(),
-                );
-            };
-            let end = block.find("-----END CERTIFICATE-----").ok_or_else(|| {
-                "configured Baffle CA certificate has an incomplete PEM block".to_string()
+    fn private_ca_certificate_file(pem: &str) -> Result<(OwnedFd, tempfile::TempDir), String> {
+        let directory = tempfile::Builder::new()
+            .prefix("gantry-baffle-trust-")
+            .tempdir()
+            .map_err(|error| {
+                format!("failed to create private Baffle CA trust directory: {error}")
             })?;
-            remainder = block[end + "-----END CERTIFICATE-----".len()..].trim();
-            certificates += 1;
-        }
-        if certificates == 0 {
-            return Err(
-                "configured Baffle CA file must contain at least one public certificate"
-                    .to_string(),
-            );
-        }
-        Ok(())
+        let path = directory.path().join("ca.pem");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("failed to create private Baffle CA trust file: {error}"))?;
+        file.write_all(pem.as_bytes()).map_err(|error| {
+            format!("failed to write private Baffle CA trust material: {error}")
+        })?;
+        file.flush().map_err(|error| {
+            format!("failed to flush private Baffle CA trust material: {error}")
+        })?;
+        drop(file);
+        let descriptor = open_pinned(&path, true)
+            .map_err(|error| format!("failed to pin private Baffle CA trust material: {error}"))?;
+        Ok((descriptor, directory))
     }
 
     fn duplicate_inheritable(fd: RawFd, minimum: RawFd) -> io::Result<OwnedFd> {
@@ -741,6 +716,39 @@ mod linux {
         } else {
             let _ = child.wait().await;
             String::new()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+
+        #[test]
+        fn pinned_data_socket_remains_the_original_socket_after_path_replacement() {
+            let directory = tempfile::tempdir().expect("temporary socket directory");
+            let socket_path = directory.path().join("session.sock");
+            let original_listener = UnixListener::bind(&socket_path).expect("original socket");
+            let descriptor = open_pinned(&socket_path, true).expect("pin original socket");
+            let mut pinned_before = MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                unsafe { libc::fstat(descriptor.as_raw_fd(), pinned_before.as_mut_ptr()) },
+                0
+            );
+            let pinned_before = unsafe { pinned_before.assume_init() };
+            drop(original_listener);
+            fs::remove_file(&socket_path).expect("remove original socket path");
+
+            let replacement_listener =
+                UnixListener::bind(&socket_path).expect("replacement socket");
+            let replacement = fs::symlink_metadata(&socket_path).expect("replacement metadata");
+            assert_ne!(
+                (pinned_before.st_dev, pinned_before.st_ino),
+                (replacement.dev(), replacement.ino())
+            );
+            assert!(descriptor_is_socket(descriptor.as_raw_fd()).expect("pinned socket type"));
+            drop(replacement_listener);
         }
     }
 }
