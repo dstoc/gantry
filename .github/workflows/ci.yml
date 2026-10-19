@@ -22,10 +22,10 @@ jobs:
           # needs capabilities inside its nested user namespace, so disable
           # that host restriction for this ephemeral CI runner.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # The test container must permit Bubblewrap's nested namespace and
+          # proc mounts. It is disposable and used only for this CI test.
           sudo podman run --rm \
-            --cap-add=SYS_ADMIN \
-            --security-opt=seccomp=unconfined \
-            --security-opt=apparmor=unconfined \
+            --privileged \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --workdir /workspace \
             docker.io/library/rust:1-bookworm \
