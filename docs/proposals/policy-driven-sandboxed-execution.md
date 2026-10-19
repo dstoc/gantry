@@ -293,9 +293,9 @@ Use capability validation before provisioning. Concurrent runs must each retain 
 
 ### Per-invocation isolation
 
-Spawn a new Bubblewrap sandbox for **every** authorized command, including commands without network access. Configure a private mount namespace, PID namespace, and network namespace (using `--unshare-net`) with appropriate user namespace, session, capability and inherited-descriptor restrictions. Do not rely on the parent container's default filesystem/proxy access as the child's security policy.
+Spawn a new Bubblewrap sandbox for **every** command with a named filesystem profile, including those without a Baffle session. Configure a private mount namespace, PID namespace, and network namespace (using `--unshare-net`) with appropriate user namespace, session, capability and inherited-descriptor restrictions. Do not rely on the parent container's default filesystem/proxy access as the child's security policy.
 
-Construct the filesystem view explicitly from the trusted runtime baseline plus selected resource mounts. Create private `/proc` and temporary filesystem views appropriate to the PID and mount namespace. Use `--die-with-parent`, `--new-session`, and process-group/cgroup cleanup as applicable, but verify that descendant processes cannot outlive a completed or cancelled execution.
+Construct the filesystem view explicitly from the trusted runtime baseline plus the selected profile's mounts. Create private `/proc` and temporary filesystem views appropriate to the PID and mount namespace. Use `--die-with-parent`, `--new-session`, and process-group/cgroup cleanup as applicable, but verify that descendant processes cannot outlive a completed or cancelled execution.
 
 Nested user/network namespaces may be blocked by kernel settings, seccomp, or rootless container configuration. Detect unsupported environments clearly. **Never fall back to unsandboxed command execution.**
 
