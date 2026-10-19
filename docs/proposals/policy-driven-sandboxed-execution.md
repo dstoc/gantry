@@ -32,7 +32,7 @@ This design gives each invocation its own filesystem view and network namespace,
 4. Create an isolated filesystem, process environment, and network namespace for every command.
 5. Give each network-authorized command a unique ephemeral Baffle session and only that session's data socket.
 6. Implement a local HTTP-proxy-compatible TCP-to-UDS bridge in Rust, without `socat` or another long-running external bridge service.
-7. Preserve current no-shell command semantics, executable/CWD authorization invariants, streamed output, exit reporting, and cancellation.
+7. Preserve current no-shell command semantics, trusted CWD input to Rego, authorized command forwarding, streamed output, exit reporting, and cancellation.
 8. Fail closed when policy evaluation, profile resolution, resource provisioning, namespace creation, mount setup, bridge initialization, or execution fails.
 9. Keep future OCI/microVM backends possible without changing Rego policy names or semantics.
 
@@ -365,7 +365,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Rego | Allow/deny, differing filesystem/Baffle-file selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
 | `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
-| Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands and authorized CWD path. No TOCTOU/byte-pinning tests. |
+| Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands, authorized CWD selection, and spawn failures for missing or inaccessible CWD paths. No TOCTOU/identity-pinning tests. |
 | Network | `baffle_session: null` blocks direct egress; selected HTTPS CONNECT succeeds; Baffle host/path/credential rules respected; no alternate proxy or control socket access. |
 | Concurrency | Simultaneous commands each bind `127.0.0.1:3128` with different Baffle sessions; neither can reach the other's endpoint. |
 | Lifecycle | Success, nonzero exit, provisioning failure, mount failure, bridge failure, child cancellation, client disconnect, server termination, descendant cleanup, lease release. |
