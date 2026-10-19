@@ -391,7 +391,7 @@ Keep command request fields (`executable`, `args`, `cwd`, `env`) unchanged for M
 | Area | Essential tests |
 | --- | --- |
 | Rego | Allow/deny, differing filesystem/Baffle-file selections, invalid names/types, conflicting decisions, snapshot reload consistency. |
-| `/check` | Reports intended profiles; performs no Baffle creation or process spawn; real execution reauthorizes. |
+| `/check` | Reports intended profiles and derived backend; performs no Baffle creation or process spawn; real execution reauthorizes. |
 | Filesystem | RO blocks writes, RW allows writes, tmpfs ephemeral, unmounted files hidden, protected paths inaccessible, symlink/path/mount race tests. |
 | Executable/CWD | Supervisor receives the resolved absolute executable path and authorized arguments/environment, performs no `PATH` lookup or policy recheck, and executes at the expected sandbox path; test ELF/shebang commands, authorized CWD selection, and spawn failures for missing or inaccessible CWD paths. No TOCTOU/identity-pinning tests. |
 | Network | Bubblewrap with `baffle_session: null` has no external network; Baffle session rules remain enforced; Direct inherits Gantry networking and requires a null Baffle selection. |
