@@ -149,7 +149,7 @@ impl AppConfig {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
-        let backend = cli_backend.unwrap_or(ExecutionBackend::Direct);
+        let backend = cli_backend.unwrap_or(ExecutionBackend::Bubblewrap);
         let default_cwd =
             std::env::current_dir().map_err(|source| ConfigError::CurrentDir { source })?;
         validate_default_cwd(&default_cwd)?;
@@ -342,7 +342,7 @@ impl ServerHandler for McpRunServer {
 }
 
 pub fn build_app(policy_engine: Arc<PolicyEngine>, default_cwd: PathBuf) -> Router {
-    build_app_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct)
+    build_app_with_backend(policy_engine, default_cwd, ExecutionBackend::Bubblewrap)
 }
 
 pub fn build_app_with_backend(
@@ -450,6 +450,28 @@ mod tests {
         );
 
         PolicyEngine::from_rego_for_tests(&[("main.rego", &main)])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_policy(root: &Path, executable: &str) -> PolicyEngine {
+        let policy_dir = root.join("policies");
+        let filesystem_dir = root.join("filesystems");
+        fs::create_dir_all(&policy_dir).expect("create policy directory");
+        fs::create_dir_all(&filesystem_dir).expect("create filesystem directory");
+        let executable = serde_json::to_string(executable).expect("encode executable");
+        fs::write(
+            policy_dir.join("main.rego"),
+            format!(
+                "package sandbox.main\n\ndefault decision := {{\"allow\": false, \"filesystem\": null, \"baffle_session\": null}}\n\ndecision := {{\"allow\": true, \"filesystem\": \"minimal\", \"baffle_session\": null}} if {{\n  input.path == {executable}\n}}\n"
+            ),
+        )
+        .expect("write policy");
+        fs::write(
+            filesystem_dir.join("minimal.toml"),
+            "version = 1\nmounts = []\n",
+        )
+        .expect("write minimal profile");
+        PolicyEngine::from_sources(Some(policy_dir))
     }
 
     fn config_from_env(
@@ -598,7 +620,7 @@ mod tests {
         );
         assert_eq!(config.bind_uds, None);
         assert_eq!(config.policy_dir, None);
-        assert_eq!(config.backend, ExecutionBackend::Direct);
+        assert_eq!(config.backend, ExecutionBackend::Bubblewrap);
 
         let args = vec![
             "--policy-dir".to_string(),
@@ -628,7 +650,7 @@ mod tests {
             Some("0.0.0.0:3000".parse().expect("address"))
         );
         assert_eq!(config.policy_dir, Some(PathBuf::from("/env/policies")));
-        assert_eq!(config.backend, ExecutionBackend::Direct);
+        assert_eq!(config.backend, ExecutionBackend::Bubblewrap);
     }
 
     #[tokio::test]
@@ -666,7 +688,11 @@ mod tests {
         let policy_engine = rego_engine_allow_commands(&[&env_path]);
         let default_cwd = std::env::current_dir().expect("current dir");
         let expected_cwd = default_cwd.to_string_lossy().into_owned();
-        let app = build_app(Arc::new(policy_engine), default_cwd);
+        let app = build_app_with_backend(
+            Arc::new(policy_engine),
+            default_cwd,
+            ExecutionBackend::Direct,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -745,6 +771,82 @@ mod tests {
         server_task.abort();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mcp_default_bubblewrap_backend_runs_and_checks_through_shared_lifecycle() {
+        if !crate::backend::host_has_required_bubblewrap() {
+            return;
+        }
+        let printf = match find_executable("printf") {
+            Some(path) => path,
+            None => return,
+        };
+        let root = tempfile::tempdir().expect("sandbox policy root");
+        let policy_engine = bubblewrap_policy(root.path(), &printf);
+        let default_cwd = std::env::current_dir().expect("current directory");
+        let app = build_app(Arc::new(policy_engine), default_cwd);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let client =
+            ().serve(StreamableHttpClientTransport::from_uri(url))
+                .await
+                .expect("connect MCP client");
+        let check = client
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: "check_command".to_string().into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "executable": printf,
+                        "args": ["ignored"],
+                        "cwd": "/"
+                    })
+                    .as_object()
+                    .cloned()
+                    .expect("object arguments"),
+                ),
+                task: None,
+            })
+            .await
+            .expect("check command");
+        let check: RunCommandCheckOutput = check.into_typed().expect("typed check");
+        assert!(check.allowed, "{:?}", check.reason);
+        assert_eq!(check.filesystem.as_deref(), Some("minimal"));
+        assert_eq!(check.backend, "bubblewrap");
+
+        let result = client
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: "run_command".to_string().into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "executable": printf,
+                        "args": ["mcp-bubblewrap"],
+                        "cwd": "/"
+                    })
+                    .as_object()
+                    .cloned()
+                    .expect("object arguments"),
+                ),
+                task: None,
+            })
+            .await
+            .expect("run command");
+        let output: RunCommandOutput = result.into_typed().expect("typed output");
+        assert_eq!(output.stdout, "mcp-bubblewrap");
+        assert_eq!(output.exit_code, Some(0));
+
+        client.cancel().await.expect("cancel MCP client");
+        server_task.abort();
+    }
+
     #[tokio::test]
     async fn mcp_tool_output_still_truncates_at_one_mb() {
         let head_path = match find_executable("head") {
@@ -754,9 +856,10 @@ mod tests {
 
         let requested = MAX_OUTPUT_BYTES + 5;
         let policy_engine = rego_engine_allow_commands(&[&head_path]);
-        let app = build_app(
+        let app = build_app_with_backend(
             Arc::new(policy_engine),
             std::env::current_dir().expect("current dir"),
+            ExecutionBackend::Direct,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -806,9 +909,10 @@ mod tests {
         };
 
         let policy_engine = rego_engine_allow_commands(&[&true_path]);
-        let app = build_app(
+        let app = build_app_with_backend(
             Arc::new(policy_engine),
             std::env::current_dir().expect("current dir"),
+            ExecutionBackend::Direct,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

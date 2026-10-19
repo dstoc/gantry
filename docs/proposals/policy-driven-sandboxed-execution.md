@@ -494,6 +494,16 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 
 **Phase gate:** Both backends work through `/mcp`, `/raw`, and `/check`; Bubblewrap executes real commands with profile-enforced filesystem access and **no external network** without Baffle. No Baffle dependency is required for this gate.
 
+### Phase 2 implementation decisions
+
+- The runtime baseline is assembled from the authorized executable, its ELF `PT_INTERP` and `DT_NEEDED` entries, shebang interpreters, the supervisor, and recursively required system libraries. Gantry parses ELF metadata and uses the administrator-managed loader configuration; it does not run the authorized executable on the host to discover dependencies. A library path from ELF RPATH/RUNPATH is considered only when the selected profile exposes that source. Gantry does not expand host `LD_LIBRARY_PATH` or `LD_PRELOAD` into new mounts. Missing dependencies fail startup.
+- Bubblewrap source objects are opened as path descriptors. Profile sources use `openat2` with `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`; runtime file aliases are opened and pinned. The launcher uses `--bind-fd` or `--ro-bind-fd`, and rejects a profile that would replace an authorized runtime path with a different object. The source pathname is not re-resolved during mount setup.
+- The sandbox has a private `/proc`, `/tmp`, and `/run`, a fresh `/dev`, user, mount, PID, and network namespaces, and no capabilities. Bubblewrap setup uses a restricted root assembled from the runtime baseline and selected profile. The server does not bind the parent root.
+- Gantry sends the typed authorized invocation to `gantry-supervisor` over the launcher stdin pipe. The supervisor writes one trusted JSON startup line to its stdout after the authorized child starts, then forwards the child's stdout and stderr. The parent removes the startup line from the command output stream. A setup error line is returned before `/raw` sends `start`; a child exit code is reported after `start`.
+- The supervisor runs as PID 1 in the sandbox. It kills and reaps remaining namespace processes after the authorized child exits. Gantry owns the Bubblewrap launcher until wait or cancellation; `--die-with-parent` handles launcher and parent death. Direct uses a separate process group and kills remaining group members on completion or cancellation.
+- Phase 2 does not provision Baffle. Bubblewrap rejects a non-null Baffle selection as unsupported. A null selection opens no proxy listener and runs with an isolated network namespace. There is no fallback to Direct.
+- Bubblewrap is now the server default. Direct requires `--backend direct` and both policy fields set to `null`.
+
 ### Phase 3 — Per-command Baffle sessions and in-process bridge
 
 **Code locations:** new `src/baffle.rs` (trusted session owner), Bubblewrap backend, and `src/bin/gantry-supervisor.rs`.
@@ -521,13 +531,10 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 
 ## 10. Open decisions
 
-1. **Trusted runtime root:** How should Gantry define and provision the minimum executable, dynamic libraries and system files while avoiding wholesale exposure of the parent root filesystem?
-2. **Filesystem source integrity:** Which descriptor-based Linux APIs and mount strategy will preserve mount-source identity across Bubblewrap setup? Executable byte/inode identity across the authorization-to-spawn interval is explicitly not required.
-3. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
-4. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
-5. **Process-tree termination:** Are PID namespaces plus supervisor signalling sufficient for all supported environments, or does Gantry additionally require cgroups or another reaper mechanism?
-6. **Profile configuration and reload:** Phase 1 resolves profile and migration choices: TOML profiles use the sibling `filesystems/` directory, version 1, strict direct paths, and a SHA-256 fingerprint across Rego and profile contents; each valid reload publishes both together. Baffle selections are single `.toml` filenames whose contents remain daemon-managed. Existing boolean policies require migration to `data.sandbox.main.decision`. Phase 2 must still choose descriptor-based mount operations for the validated sources.
-7. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
+1. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
+2. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
+3. **Profile configuration and reload:** Phase 1 resolves profile and migration choices: TOML profiles use the sibling `filesystems/` directory, version 1, strict direct paths, and a SHA-256 fingerprint across Rego and profile contents; each valid reload publishes both together. Baffle selections are single `.toml` filenames whose contents remain daemon-managed. Existing boolean policies require migration to `data.sandbox.main.decision`.
+4. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
 
 ## Final acceptance criteria
 

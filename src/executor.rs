@@ -2,16 +2,15 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
 
-use crate::execution::{AuthorizedInvocation, ExecutionBackend, ExecutionPlan};
+use crate::backend::{self, StartError};
+use crate::execution::{AuthorizedInvocation, ExecutionBackend, ExecutionPlan, RunningExecution};
 use crate::policy::{PolicyEngine, ValidationError};
 
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -61,8 +60,8 @@ pub enum ToolError {
     Validation(#[from] ValidationError),
     #[error("Failed to start subprocess: {source}")]
     Spawn { source: std::io::Error },
-    #[error("execution backend '{backend}' is not implemented in this release")]
-    BackendUnavailable { backend: String },
+    #[error("execution backend setup failed: {details}")]
+    BackendSetup { details: String },
     #[error("Failed to wait for subprocess: {source}")]
     Wait { source: std::io::Error },
     #[error("Failed to read stdout: {source}")]
@@ -80,7 +79,13 @@ pub async fn run_command_impl(
     default_cwd: &Path,
     input: RunCommandInput,
 ) -> Result<RunCommandOutput, ToolError> {
-    run_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input).await
+    run_command_with_backend(
+        policy_engine,
+        default_cwd,
+        ExecutionBackend::Bubblewrap,
+        input,
+    )
+    .await
 }
 
 pub async fn run_command_with_backend(
@@ -89,19 +94,24 @@ pub async fn run_command_with_backend(
     backend: ExecutionBackend,
     input: RunCommandInput,
 ) -> Result<RunCommandOutput, ToolError> {
-    let mut child = spawn_command_process_with_backend(policy_engine, default_cwd, backend, input)?;
+    let mut execution =
+        start_command_process_with_backend(policy_engine, default_cwd, backend, input).await?;
 
-    let stdout = child.stdout.take().ok_or_else(|| ToolError::StdoutRead {
-        source: std::io::Error::other("stdout pipe missing"),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| ToolError::StderrRead {
-        source: std::io::Error::other("stderr pipe missing"),
-    })?;
+    let stdout = execution
+        .take_stdout()
+        .ok_or_else(|| ToolError::StdoutRead {
+            source: std::io::Error::other("stdout pipe missing"),
+        })?;
+    let stderr = execution
+        .take_stderr()
+        .ok_or_else(|| ToolError::StderrRead {
+            source: std::io::Error::other("stderr pipe missing"),
+        })?;
 
     let stdout_task = tokio::spawn(read_limited(stdout));
     let stderr_task = tokio::spawn(read_limited(stderr));
 
-    let status = child
+    let status = execution
         .wait()
         .await
         .map_err(|source| ToolError::Wait { source })?;
@@ -125,20 +135,12 @@ pub async fn run_command_with_backend(
     })
 }
 
-pub fn spawn_command_process(
-    policy_engine: &PolicyEngine,
-    default_cwd: &Path,
-    input: RunCommandInput,
-) -> Result<Child, ToolError> {
-    spawn_command_process_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input)
-}
-
-pub fn spawn_command_process_with_backend(
+pub(crate) async fn start_command_process_with_backend(
     policy_engine: &PolicyEngine,
     default_cwd: &Path,
     backend: ExecutionBackend,
     input: RunCommandInput,
-) -> Result<Child, ToolError> {
+) -> Result<RunningExecution, ToolError> {
     let authorization = authorize_command_request(policy_engine, default_cwd, backend, input);
     if !authorization.decision.allowed {
         return Err(ToolError::Validation(
@@ -148,50 +150,24 @@ pub fn spawn_command_process_with_backend(
         ));
     }
 
-    if backend == ExecutionBackend::Bubblewrap {
-        return Err(ToolError::BackendUnavailable {
-            backend: backend.as_str().to_string(),
-        });
-    }
-
-    let plan = authorization
-        .plan
-        .as_ref()
-        .expect("allowed authorization without plan");
-    let invocation = &plan.invocation;
+    let plan = authorization.plan.ok_or_else(|| ToolError::BackendSetup {
+        details: "allowed authorization did not produce an execution plan".to_string(),
+    })?;
     let authorized_cwd = authorization
         .authorized_cwd
-        .as_ref()
-        .expect("allowed authorization without cwd");
+        .ok_or_else(|| ToolError::BackendSetup {
+            details: "allowed authorization did not preserve the trusted cwd".to_string(),
+        })?;
+    #[cfg(unix)]
+    let cwd_fd = std::os::fd::AsRawFd::as_raw_fd(&authorized_cwd.fd);
+    #[cfg(not(unix))]
+    let cwd_fd = -1;
 
-    tracing::debug!(
-        executable_hash = %invocation.executable_hash,
-        policy_generation = invocation.generation.id(),
-        cwd = %invocation.cwd_label,
-        effective_cwd = %invocation.cwd.display(),
-        "starting authorized direct invocation",
-    );
-    let mut command = Command::new(&invocation.executable);
-    command
-        .args(&invocation.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    set_authorized_cwd_for_spawn(&mut command, authorized_cwd);
-
-    command.env_clear();
-    command.envs(
-        invocation
-            .environment
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
-
-    command
-        .spawn()
-        .map_err(|source| ToolError::Spawn { source })
+    match backend::start(plan, cwd_fd).await {
+        Ok(execution) => Ok(execution),
+        Err(StartError::Spawn(source)) => Err(ToolError::Spawn { source }),
+        Err(StartError::Setup(details)) => Err(ToolError::BackendSetup { details }),
+    }
 }
 
 pub fn check_command(
@@ -199,7 +175,12 @@ pub fn check_command(
     default_cwd: &Path,
     input: RunCommandInput,
 ) -> RunCommandCheckOutput {
-    check_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input)
+    check_command_with_backend(
+        policy_engine,
+        default_cwd,
+        ExecutionBackend::Bubblewrap,
+        input,
+    )
 }
 
 pub fn check_command_with_backend(
@@ -545,22 +526,6 @@ fn resolve_authorized_cwd_absolute(
     })
 }
 
-#[cfg(unix)]
-fn set_authorized_cwd_for_spawn(command: &mut Command, authorized_cwd: &AuthorizedCwd) {
-    use std::os::fd::AsRawFd;
-
-    let cwd_fd = authorized_cwd.fd.as_raw_fd();
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(cwd_fd) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-}
-
 pub(crate) fn resolve_executable_path(
     command: &str,
     working_directory: &Path,
@@ -780,6 +745,22 @@ mod tests {
     use super::*;
     use crate::policy::PolicyEngine;
 
+    fn check_direct(
+        policy_engine: &PolicyEngine,
+        default_cwd: &Path,
+        input: RunCommandInput,
+    ) -> RunCommandCheckOutput {
+        check_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input)
+    }
+
+    async fn run_direct(
+        policy_engine: &PolicyEngine,
+        default_cwd: &Path,
+        input: RunCommandInput,
+    ) -> Result<RunCommandOutput, ToolError> {
+        run_command_with_backend(policy_engine, default_cwd, ExecutionBackend::Direct, input).await
+    }
+
     fn default_cwd_for_tests() -> PathBuf {
         std::env::current_dir().expect("test cwd should resolve")
     }
@@ -793,6 +774,43 @@ mod tests {
             }
         }
         None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_capable() -> bool {
+        crate::backend::host_has_required_bubblewrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn system_library_directory_for_tests() -> PathBuf {
+        for candidate in [
+            "/lib64/libc.so.6",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib/aarch64-linux-gnu/libc.so.6",
+        ] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return std::fs::canonicalize(path.parent().expect("library parent"))
+                    .expect("canonical library directory");
+            }
+        }
+        let executable = ["/sbin/ldconfig", "/usr/sbin/ldconfig"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .expect("ldconfig executable");
+        let output = std::process::Command::new(executable)
+            .arg("-p")
+            .env_clear()
+            .output()
+            .expect("read loader cache");
+        let output = String::from_utf8_lossy(&output.stdout);
+        let line = output
+            .lines()
+            .find(|line| line.trim_start().starts_with("libc.so.6 "))
+            .expect("libc loader cache entry");
+        let path = line.split_once("=>").expect("loader cache path").1.trim();
+        std::fs::canonicalize(Path::new(path).parent().expect("libc parent"))
+            .expect("canonical libc directory")
     }
 
     fn parse_env_output(output: &str) -> BTreeMap<String, String> {
@@ -873,6 +891,50 @@ mod tests {
         }
     }
 
+    fn compile_rpath_test_command(directory: &Path) -> PathBuf {
+        std::fs::create_dir_all(directory).expect("custom library directory");
+        let library_source = directory.join("libreview.c");
+        let command_source = directory.join("command.c");
+        let library = directory.join("libreview.so");
+        let command = directory.join("command");
+        std::fs::write(&library_source, "int answer(void) { return 42; }\n")
+            .expect("write custom library source");
+        std::fs::write(
+            &command_source,
+            "int answer(void); int main(void) { return answer() == 42 ? 0 : 1; }\n",
+        )
+        .expect("write custom command source");
+
+        let output = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&library_source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .expect("start C compiler for custom shared library");
+        assert!(
+            output.status.success(),
+            "custom library compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = std::process::Command::new("cc")
+            .arg(&command_source)
+            .arg(format!("-L{}", directory.display()))
+            .arg("-lreview")
+            .arg(format!("-Wl,-rpath,{}", directory.display()))
+            .arg("-o")
+            .arg(&command)
+            .output()
+            .expect("start C compiler for custom command");
+        assert!(
+            output.status.success(),
+            "custom command compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        command
+    }
+
     #[test]
     fn backend_compatibility_matrix_is_reported_by_check_without_execution() {
         let true_path = find_executable("true").expect("true executable");
@@ -935,6 +997,9 @@ mod tests {
             Some("github-readonly.toml")
         );
         assert_eq!(bubblewrap.backend, "bubblewrap");
+        let default_backend = check_command(&profile_engine, &default_cwd, input());
+        assert!(default_backend.allowed, "{:?}", default_backend.reason);
+        assert_eq!(default_backend.backend, "bubblewrap");
         let serialized = serde_json::to_value(&bubblewrap).expect("serialize check result");
         assert_eq!(
             serialized
@@ -1177,9 +1242,13 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
     }
 
     #[tokio::test]
-    async fn explicit_unimplemented_bubblewrap_never_falls_back_to_direct() {
+    async fn bubblewrap_setup_failure_never_falls_back_to_direct() {
         let true_path = find_executable("true").expect("true executable");
         let root = tempfile::tempdir().expect("profile root");
+        // The Bubblewrap backend always replaces /tmp with a private tmpfs.
+        // Use a host directory there so the authorized CWD is guaranteed to
+        // be absent inside the sandbox, including when CI itself runs in /workspace.
+        let hidden_cwd = tempfile::tempdir_in("/tmp").expect("hidden cwd");
         let engine = policy_engine_with_selection(root.path(), Some("workspace"), None);
         let error = run_command_with_backend(
             &engine,
@@ -1188,14 +1257,441 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             RunCommandInput {
                 executable: true_path,
                 args: vec![],
-                cwd: None,
+                cwd: Some(hidden_cwd.path().to_string_lossy().into_owned()),
                 env: None,
             },
         )
         .await
-        .expect_err("Bubblewrap backend must not use direct execution");
+        .expect_err("unmounted authorized cwd must prevent execution");
+        assert!(matches!(error, ToolError::BackendSetup { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn buffered_execution_preserves_signal_termination_and_exit_128() {
+        let shell = match find_executable("sh") {
+            Some(path) => path,
+            None => return,
+        };
+        let cwd = default_cwd_for_tests();
+        let direct_engine = rego_engine_allow_commands(&[&shell]);
+        let invoke = |script: &str| RunCommandInput {
+            executable: shell.clone(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: Some("/".to_string()),
+            env: None,
+        };
+
+        let output = run_command_with_backend(
+            &direct_engine,
+            &cwd,
+            ExecutionBackend::Direct,
+            invoke("kill -TERM $$"),
+        )
+        .await
+        .expect("Direct signal execution");
+        assert_eq!(output.exit_code, None);
+
+        let output = run_command_with_backend(
+            &direct_engine,
+            &cwd,
+            ExecutionBackend::Direct,
+            invoke("exit 128"),
+        )
+        .await
+        .expect("Direct exit 128 execution");
+        assert_eq!(output.exit_code, Some(128));
+
+        if !bubblewrap_capable() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("Bubblewrap policy root");
+        let bubblewrap_engine = policy_engine_with_selection(root.path(), Some("minimal"), None);
+        let output = run_command_with_backend(
+            &bubblewrap_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            invoke("kill -TERM $$"),
+        )
+        .await
+        .expect("Bubblewrap signal execution");
+        assert_eq!(output.exit_code, None);
+
+        let output = run_command_with_backend(
+            &bubblewrap_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            invoke("exit 128"),
+        )
+        .await
+        .expect("Bubblewrap exit 128 execution");
+        assert_eq!(output.exit_code, Some(128));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_uses_custom_rpath_libraries_only_when_the_profile_mounts_them() {
+        if !bubblewrap_capable() {
+            return;
+        }
+        let cwd = default_cwd_for_tests();
+        let root = tempfile::tempdir_in(&cwd).expect("test root");
+        let custom_dir = root.path().join("custom");
+        let command = compile_rpath_test_command(&custom_dir);
         assert!(
-            matches!(error, ToolError::BackendUnavailable { backend } if backend == "bubblewrap")
+            std::process::Command::new(&command)
+                .status()
+                .expect("run custom command on host")
+                .success(),
+            "custom RPATH command did not run on the host"
+        );
+
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        std::fs::create_dir_all(&policy_dir).expect("policy directory");
+        std::fs::create_dir_all(&filesystem_dir).expect("filesystem directory");
+        std::fs::write(
+            filesystem_dir.join("custom.toml"),
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
+                custom_dir.to_string_lossy(),
+                custom_dir.to_string_lossy(),
+            ),
+        )
+        .expect("write custom profile");
+        std::fs::write(
+            filesystem_dir.join("minimal.toml"),
+            "version = 1\nmounts = []\n",
+        )
+        .expect("write minimal profile");
+
+        for profile in ["custom", "minimal"] {
+            std::fs::write(
+                policy_dir.join("main.rego"),
+                format!(
+                    "package sandbox.main\n\ndecision := {{\"allow\": true, \"filesystem\": {}, \"baffle_session\": null}}\n",
+                    serde_json::to_string(profile).expect("encode filesystem profile")
+                ),
+            )
+            .expect("update policy");
+            let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+            let result = run_command_with_backend(
+                &engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                RunCommandInput {
+                    executable: command.to_string_lossy().into_owned(),
+                    args: vec![],
+                    cwd: Some("/".to_string()),
+                    env: None,
+                },
+            )
+            .await;
+            if profile == "custom" {
+                let output = result.expect("mounted custom RPATH library is available");
+                assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+            } else {
+                let error = result.expect_err("unmounted custom RPATH library must be rejected");
+                assert!(
+                    matches!(error, ToolError::BackendSetup { ref details } if details.contains("libreview.so")),
+                    "unexpected missing-library error: {error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_runs_elf_command_with_restricted_runtime_and_private_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bubblewrap = std::path::Path::new("/usr/bin/bwrap");
+        if !bubblewrap.is_file() || !bubblewrap_capable() {
+            return;
+        }
+        let cwd = default_cwd_for_tests();
+        let root = tempfile::tempdir_in(&cwd).expect("profile root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        std::fs::create_dir(&policy_dir).expect("policy directory");
+        std::fs::create_dir(&filesystem_dir).expect("filesystem directory");
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            "package sandbox.main\n\ndecision := {\"allow\": true, \"filesystem\": \"workspace\", \"baffle_session\": null}\n",
+        )
+        .expect("policy");
+        std::fs::write(
+            filesystem_dir.join("workspace.toml"),
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n\n[[mounts]]\nsource = \"/usr/bin\"\ntarget = \"/test-bin\"\naccess = \"read-only\"\n\n[[mounts]]\nsource = {:?}\ntarget = \"/test-lib\"\naccess = \"read-only\"\n",
+                workspace.to_string_lossy(),
+                workspace.to_string_lossy(),
+                system_library_directory_for_tests().to_string_lossy(),
+            ),
+        )
+        .expect("filesystem profile");
+        let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+        let printf = find_executable("printf").expect("printf executable");
+        let private_tmp_file = root.path().join("must-not-exist-on-host");
+        let output = run_command_impl(
+            &engine,
+            &cwd,
+            RunCommandInput {
+                executable: printf,
+                args: vec!["sandboxed".to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("Bubblewrap starts the authorized command");
+        assert_eq!(output.stdout, "sandboxed");
+        assert_eq!(output.exit_code, Some(0));
+
+        let script = workspace.join("hello.sh");
+        std::fs::write(&script, b"#!/bin/sh\nprintf shebang-ok\n").expect("write script");
+        let mut script_permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        script_permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, script_permissions).expect("script is executable");
+        let output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: script.to_string_lossy().into_owned(),
+                args: vec![],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("Bubblewrap starts the authorized shebang command");
+        assert_eq!(output.stdout, "shebang-ok");
+        assert_eq!(output.exit_code, Some(0));
+
+        let touch = find_executable("touch").expect("touch executable");
+        let output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: touch,
+                args: vec![private_tmp_file.to_string_lossy().into_owned()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("private tmpfs command starts");
+        assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        assert!(
+            !private_tmp_file.exists(),
+            "sandbox /tmp leaked to the host"
+        );
+
+        let test_binary = find_executable("test").expect("test executable");
+        let control_socket = root.path().join("host-control.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&control_socket).expect("host control socket");
+        let output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: test_binary.clone(),
+                args: vec!["!".to_string(), "-e".to_string(), "/etc/passwd".to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("protected path probe starts");
+        assert_eq!(output.exit_code, Some(0), "host /etc/passwd was visible");
+        let output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: test_binary,
+                args: vec![
+                    "!".to_string(),
+                    "-S".to_string(),
+                    control_socket.to_string_lossy().into_owned(),
+                ],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("host socket probe starts");
+        assert_eq!(output.exit_code, Some(0), "host control socket was visible");
+        drop(listener);
+
+        let write_target = workspace.join("read-only-write");
+        let output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: find_executable("touch").expect("touch executable"),
+                args: vec![write_target.to_string_lossy().into_owned()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("read-only mount command starts");
+        assert_ne!(output.exit_code, Some(0));
+        assert!(!write_target.exists(), "read-only profile allowed a write");
+
+        let writable_profile = filesystem_dir.join("workspace.toml");
+        std::fs::write(
+            &writable_profile,
+            format!(
+                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-write\"\n\n[[mounts]]\nsource = \"/usr/bin\"\ntarget = \"/test-bin\"\naccess = \"read-only\"\n\n[[mounts]]\nsource = {:?}\ntarget = \"/test-lib\"\naccess = \"read-only\"\n",
+                workspace.to_string_lossy(),
+                workspace.to_string_lossy(),
+                system_library_directory_for_tests().to_string_lossy(),
+            ),
+        )
+        .expect("write writable profile");
+        let writable_engine = PolicyEngine::from_sources(Some(policy_dir));
+        let writable_target = workspace.join("read-write-allowed");
+        let output = run_command_with_backend(
+            &writable_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: find_executable("touch").expect("touch executable"),
+                args: vec![writable_target.to_string_lossy().into_owned()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("read-write mount command starts");
+        assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        assert!(
+            writable_target.exists(),
+            "read-write profile rejected a write"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let curl = find_executable("curl").expect("curl executable");
+        let output = run_command_with_backend(
+            &writable_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: curl,
+                args: vec![
+                    "--max-time".to_string(),
+                    "2".to_string(),
+                    format!("http://127.0.0.1:{port}/"),
+                ],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("network probe starts inside Bubblewrap");
+        assert_ne!(
+            output.exit_code,
+            Some(0),
+            "sandbox reached the host loopback listener"
+        );
+        drop(listener);
+
+        let cat = find_executable("cat").expect("cat executable");
+        let output = run_command_with_backend(
+            &writable_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: cat,
+                args: vec!["/proc/net/route".to_string()],
+                cwd: Some("/".to_string()),
+                env: None,
+            },
+        )
+        .await
+        .expect("private network route table is readable");
+        assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        assert!(
+            output
+                .stdout
+                .lines()
+                .skip(1)
+                .all(|route| route.split_whitespace().nth(1) != Some("00000000")),
+            "sandbox had an external default route: {}",
+            output.stdout
+        );
+
+        let shell = find_executable("sh").expect("shell executable");
+        let descendant_marker = workspace.join("descendant-survived");
+        let shell_script = "(/test-bin/sleep 0.5; /test-bin/touch \"$1\") & exit 0";
+        let output = run_command_with_backend(
+            &writable_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: shell.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    shell_script.to_string(),
+                    "gantry-shell".to_string(),
+                    descendant_marker.to_string_lossy().into_owned(),
+                ],
+                cwd: Some("/".to_string()),
+                env: Some(BTreeMap::from([(
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/test-lib".to_string(),
+                )])),
+            },
+        )
+        .await
+        .expect("background descendant command starts");
+        assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !descendant_marker.exists(),
+            "sandbox completion left a descendant running"
+        );
+
+        let cancelled_marker = workspace.join("cancelled-descendant-survived");
+        let mut execution = start_command_process_with_backend(
+            &writable_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: shell,
+                args: vec![
+                    "-c".to_string(),
+                    "(/test-bin/sleep 0.5; /test-bin/touch \"$1\")".to_string(),
+                    "gantry-shell".to_string(),
+                    cancelled_marker.to_string_lossy().into_owned(),
+                ],
+                cwd: Some("/".to_string()),
+                env: Some(BTreeMap::from([(
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/test-lib".to_string(),
+                )])),
+            },
+        )
+        .await
+        .expect("cancellable command starts");
+        execution.cancel().await;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !cancelled_marker.exists(),
+            "cancellation left a command descendant running"
         );
     }
 
@@ -1261,7 +1757,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             env: None,
         };
 
-        let decision = check_command(&policy_engine, &server_cwd, input());
+        let decision = check_direct(&policy_engine, &server_cwd, input());
         assert!(decision.allowed, "{:?}", decision.reason);
         assert_eq!(
             decision.resolved_path.as_deref(),
@@ -1269,7 +1765,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         );
         assert_eq!(decision.cwd.as_deref(), Some(requested_label.as_str()));
 
-        let output = run_command_impl(&policy_engine, &server_cwd, input())
+        let output = run_direct(&policy_engine, &server_cwd, input())
             .await
             .expect("relative executable should run from requested cwd");
         assert_eq!(output.exit_code, Some(0));
@@ -1388,7 +1884,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             .expect("hash should succeed");
         let expected_path = script_path.to_string_lossy().into_owned();
         let policy_engine = rego_engine_allow_commands(&[&script]);
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1426,7 +1922,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         let denied_label = denied_cwd.to_string_lossy().into_owned();
         let policy_engine = rego_engine_allow_command_in_cwd(&script, &allowed_label);
 
-        let allowed = check_command(
+        let allowed = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1439,7 +1935,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         assert!(allowed.allowed);
         assert_eq!(allowed.cwd.as_deref(), Some(allowed_label.as_str()));
 
-        let denied = check_command(
+        let denied = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1479,7 +1975,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         );
         let policy_engine = PolicyEngine::from_rego_for_tests(&[("main.rego", &module)]);
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1511,7 +2007,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         );
         let policy_engine = PolicyEngine::from_rego_for_tests(&[("main.rego", &module)]);
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             &cwd,
             RunCommandInput {
@@ -1532,7 +2028,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         let missing_cwd = temp.path().join("missing");
         let policy_engine = rego_engine_allow_commands(&["/bin/does-not-matter"]);
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1564,7 +2060,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         std::fs::write(&file_cwd, b"file").expect("write cwd file");
         let policy_engine = rego_engine_allow_commands(&["/bin/does-not-matter"]);
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1596,7 +2092,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             None => return,
         };
         let root_policy = rego_engine_allow_command_in_cwd(&true_path, "/");
-        let root_decision = check_command(
+        let root_decision = check_direct(
             &root_policy,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1618,7 +2114,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         let child_policy = rego_engine_allow_command_in_cwd(&true_path, &child_label);
 
         let repeated = format!("{}//child", parent.to_string_lossy());
-        let repeated_decision = check_command(
+        let repeated_decision = check_direct(
             &child_policy,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1631,7 +2127,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         assert!(repeated_decision.allowed);
         assert_eq!(repeated_decision.cwd.as_deref(), Some(child_label.as_str()));
 
-        let trailing_decision = check_command(
+        let trailing_decision = check_direct(
             &child_policy,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1655,7 +2151,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         let policy_engine = rego_engine_allow_commands(&[&true_path]);
 
         for cwd in ["//foo", "relative-inside-default"] {
-            let decision = check_command(
+            let decision = check_direct(
                 &policy_engine,
                 default_cwd_for_tests().as_path(),
                 RunCommandInput {
@@ -1682,7 +2178,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             std::fs::create_dir(&real).expect("create real cwd");
             symlink(&real, &link).expect("create cwd symlink");
 
-            let decision = check_command(
+            let decision = check_direct(
                 &policy_engine,
                 default_cwd_for_tests().as_path(),
                 RunCommandInput {
@@ -1728,7 +2224,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         let magic_link_cwd = proc_fd.join(cwd.as_raw_fd().to_string());
         let policy_engine = rego_engine_allow_commands(&[&true_path]);
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1767,7 +2263,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
 
         let requested_label = requested_cwd.to_string_lossy().into_owned();
         let policy_engine = rego_engine_allow_command_in_cwd(&sh_path, &requested_label);
-        let output = run_command_impl(
+        let output = run_direct(
             &policy_engine,
             &default_cwd,
             RunCommandInput {
@@ -1792,7 +2288,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         };
 
         let policy_engine = rego_engine_allow_commands(&[&env_path]);
-        let output = run_command_impl(
+        let output = run_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1818,7 +2314,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         };
 
         let policy_engine = rego_engine_allow_commands(&[&env_path]);
-        let output = run_command_impl(
+        let output = run_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1904,7 +2400,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             .to_string_lossy()
             .into_owned();
         let policy_engine = rego_engine_allow_commands(&["/bin/does-not-match-this-path"]);
-        let error = run_command_impl(
+        let error = run_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1928,7 +2424,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
         };
 
         let policy_engine = rego_engine_allow_commands(&[&head_path]);
-        let output = run_command_impl(
+        let output = run_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -1965,7 +2461,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
 
         let script = script_path.to_string_lossy().into_owned();
         let policy_engine = rego_engine_allow_commands(&["/bin/does-not-match-this-path"]);
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -2002,7 +2498,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
             None => return,
         };
 
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {
@@ -2027,7 +2523,7 @@ decision := {{"allow": true, "filesystem": null, "baffle_session": null}} if {{
     #[tokio::test]
     async fn check_reports_missing_executable() {
         let policy_engine = rego_engine_allow_commands(&["/bin/does-not-matter"]);
-        let decision = check_command(
+        let decision = check_direct(
             &policy_engine,
             default_cwd_for_tests().as_path(),
             RunCommandInput {

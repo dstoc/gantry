@@ -46,7 +46,7 @@ Command-line values take precedence over environment values. A listener flag sel
 
 The old server variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` are ignored. The `run-remote` client variables `RUN_REMOTE_SERVER` and `RUN_REMOTE_SOCKET` are unchanged.
 
-Phase 1 keeps Direct as the default so existing deployments retain their working execution path. A selected Bubblewrap plan can be checked, but command execution with `--backend bubblewrap` fails closed until Phase 2 implements that backend. Gantry never reports or runs Direct as Bubblewrap. Phase 2 will change the runtime default to Bubblewrap.
+Bubblewrap is the default backend. It requires Linux, Bubblewrap with descriptor-based bind support, and the `gantry-supervisor` binary installed beside `gantry`. Each command receives a separate user, mount, PID, and network namespace. A restricted runtime view exposes the authorized executable, its interpreter and shared libraries, private `/proc`, `/tmp`, and `/run`, and only the selected profile mounts. Bubblewrap setup errors fail closed. Use `--backend direct` to explicitly select unsandboxed execution; Direct policies must return `filesystem: null` and `baffle_session: null`.
 
 Examples:
 
@@ -73,15 +73,18 @@ When `GANTRY_POLICY_DIR=/etc/gantry/policies`, place filesystem profiles in `/et
 From this folder:
 
 ```bash
-cargo run
+cargo build --bins
+./target/debug/gantry
 ```
 
 Or build binaries:
 
 ```bash
-cargo build --release
+cargo build --release --bins
 # server
 ./target/release/gantry
+# execution supervisor, installed beside gantry
+./target/release/gantry-supervisor
 # helper client
 ./target/release/run-remote
 ```
