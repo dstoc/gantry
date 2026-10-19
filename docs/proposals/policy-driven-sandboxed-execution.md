@@ -289,6 +289,14 @@ Direct is a deliberate policy selection; no backend failure changes a named file
 
 Use capability validation before provisioning. Concurrent runs must each retain their own immutable policy/profile snapshot and execution ownership.
 
+### Direct backend
+
+Direct preserves the current Gantry execution path: after authorization, spawn the resolved executable using `tokio::process::Command` with its authorized arguments, environment and CWD. Keep existing stdio, streaming, exit and cancellation behavior.
+
+Direct does not use Bubblewrap, a per-command filesystem policy, a supervisor, a Baffle lease or a command-local bridge. It inherits Gantry's filesystem and network environment, including any existing proxy configuration. Only an explicit `filesystem: null`, `baffle_session: null` decision may select it, and only if Direct is enabled in trusted configuration.
+
+A missing/invalid filesystem field must not select Direct. A failed Bubblewrap execution must not retry through Direct.
+
 ## 5. Bubblewrap backend
 
 ### Per-invocation isolation
