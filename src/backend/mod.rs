@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::RawFd;
 
 use crate::baffle::BaffleRuntimeConfig;
-use crate::execution::{ExecutionBackend, ExecutionPlan, RunningExecution};
+use crate::execution::{ExecutionBackend, ExecutionDiagnostics, ExecutionPlan, RunningExecution};
 
 pub(crate) enum StartError {
     Spawn(io::Error),
@@ -18,10 +18,32 @@ pub(crate) async fn start(
     trusted_cwd_fd: RawFd,
     baffle: BaffleRuntimeConfig,
 ) -> Result<RunningExecution, StartError> {
-    match plan.backend {
+    let diagnostics = ExecutionDiagnostics::from_plan(&plan);
+    let result = match plan.backend {
         ExecutionBackend::Direct => direct::start(plan, trusted_cwd_fd),
         ExecutionBackend::Bubblewrap => bubblewrap::start(plan, baffle).await,
+    };
+    if let Err(error) = &result {
+        match error {
+            StartError::Spawn(_) => tracing::error!(
+                backend = diagnostics.backend.as_str(),
+                filesystem_profile = ?diagnostics.filesystem_profile,
+                baffle_filename = ?diagnostics.baffle_filename,
+                phase = "setup",
+                failure_class = "process_spawn",
+                "execution setup failed",
+            ),
+            StartError::Setup(_) => tracing::error!(
+                backend = diagnostics.backend.as_str(),
+                filesystem_profile = ?diagnostics.filesystem_profile,
+                baffle_filename = ?diagnostics.baffle_filename,
+                phase = "setup",
+                failure_class = "backend_setup",
+                "execution setup failed",
+            ),
+        }
     }
+    result
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -81,11 +103,11 @@ fn bubblewrap_test_environment_error() -> Option<String> {
 #[cfg(all(test, target_os = "linux"))]
 #[test]
 fn required_bubblewrap_test_environment_is_available() {
-    if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_some() {
-        if let Some(error) = bubblewrap_test_environment_error() {
-            panic!(
-                "Bubblewrap integration tests were required, but the configured namespaces are unavailable: {error}"
-            );
-        }
+    if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_some()
+        && let Some(error) = bubblewrap_test_environment_error()
+    {
+        panic!(
+            "Bubblewrap integration tests were required, but the configured namespaces are unavailable: {error}"
+        );
     }
 }

@@ -363,6 +363,98 @@ async fn bubblewrap_mounts_a_mock_file_only_baffle_uds_and_releases_its_lease() 
     run_mock_uds_mount(directory.path()).await;
 }
 
+#[tokio::test]
+async fn baffle_creation_failure_prevents_command_start() {
+    if std::env::var_os("GANTRY_REQUIRE_BUBBLEWRAP_TESTS").is_none() {
+        eprintln!("skipping Baffle creation failure test: required Bubblewrap tests are disabled");
+        return;
+    }
+    if !Path::new("/usr/bin/bwrap").is_file() && !Path::new("/bin/bwrap").is_file() {
+        panic!("Bubblewrap is required for the Baffle creation failure test");
+    }
+
+    let directory = tempfile::tempdir_in("/dev/shm").expect("temporary fixture directory");
+    let socket_dir = directory.path().join("proxies");
+    fs::create_dir_all(&socket_dir).expect("Baffle socket directory");
+    let control_path = directory.path().join("control.sock");
+    let control_listener =
+        tokio::net::UnixListener::bind(&control_path).expect("mock Baffle control socket");
+    let daemon = tokio::spawn(async move {
+        let (mut stream, _) = control_listener
+            .accept()
+            .await
+            .expect("Gantry attempts Baffle session creation");
+        let mut header = [0; 4];
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("read Baffle request frame length");
+        let mut request = vec![0; u32::from_be_bytes(header) as usize];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("read Baffle request");
+        let request = String::from_utf8(request).expect("Baffle request is UTF-8");
+        assert!(request.contains("operation = \"create_from_file\""));
+        assert!(request.contains("name = \"unavailable.toml\""));
+
+        let response = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "ok": false,
+            "error": {
+                "code": "config_file_not_found",
+                "message": "selected session is unavailable"
+            }
+        }))
+        .expect("Baffle error response JSON");
+        stream
+            .write_all(&(response.len() as u32).to_be_bytes())
+            .await
+            .expect("write Baffle response length");
+        stream
+            .write_all(&response)
+            .await
+            .expect("write Baffle error response");
+    });
+
+    let ca_certificate = directory.path().join("ca.pem");
+    fs::write(
+        &ca_certificate,
+        "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write public certificate fixture");
+    let executable = Path::new("/usr/bin/true");
+    let policy = policy_engine(directory.path(), executable, Some("unavailable.toml"));
+    let error = run_command_with_baffle_config(
+        &policy,
+        Path::new("/"),
+        ExecutionBackend::Bubblewrap,
+        BaffleRuntimeConfig {
+            control_socket: control_path,
+            session_socket_dir: socket_dir,
+            ca_certificate: Some(ca_certificate),
+        },
+        RunCommandInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: vec![],
+            cwd: Some("/".into()),
+            env: None,
+        },
+    )
+    .await
+    .expect_err("failed Baffle creation prevents command startup");
+    assert!(
+        matches!(error, gantry::ToolError::BackendSetup { .. }),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("selected session is unavailable")
+    );
+    daemon.await.expect("mock Baffle error response completed");
+}
+
 async fn run_mock_uds_mount(root: &Path) {
     let mock_root = root.join("mock-baffle");
     let socket_dir = mock_root.join("proxies");

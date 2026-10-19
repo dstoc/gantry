@@ -523,7 +523,7 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 
 ### Phase 4 — End-to-end hardening, migration, and release
 
-1. **System tests:** Exercise `/mcp`, `/raw`, `/check`, `run-remote --check`, both listener transports and both backends end-to-end. Verify deny-all on bad policy reload, malformed/unknown profile values, mount errors, unsupported platforms, failed Baffle creation, bridge failure, child errors, client disconnect, parent termination and concurrent execution.
+1. **System tests:** Exercise `/mcp`, `/raw`, `/check`, `run-remote --check`, both listener transports and both backends through a real Gantry server. Verify deny-all on bad policy reload, malformed/unknown profile values, mount errors, unsupported platforms, failed Baffle creation, bridge failure, child errors, client disconnect, parent termination and concurrent execution.
 2. **Isolation tests:** Move the Phase 0 experiments into repeatable integration tests using the *restricted* runtime root. Assert RO/RW semantics, protection of non-mounted paths, no external networking without Baffle, no parent/local proxy or other Baffle socket access, and descendant/process-group cleanup. Include the deferred real-Baffle and session-release checks in automated integration coverage.
 3. **Diagnostics:** Report backend, selected profile, Baffle filename/session identity where safe, namespace setup versus child exit failure, and cleanup outcomes. Never log injected secrets or credential-bearing request content.
 4. **Migration:** Update README, CLI help, filesystem-profile and Rego examples, deployment documentation and environment variable names. Remove legacy `MCP_BIND_ADDR`, `MCP_BIND_UDS` and `POLICY_DIR` server configuration. Document explicit `--backend direct` plus null profiles for existing deployments, and Bubblewrap's new default/host prerequisites. Preserve the current `run-remote` client syntax and environment variables.
@@ -533,10 +533,25 @@ These are **feasibility smoke tests**, not proof of full isolation or lifecycle 
 
 ## 10. Open decisions
 
-1. **Baffle transport:** Should Gantry speak the Baffle control UDS directly when trusted, or use a separate broker? No general network-provider API is needed.
-2. **Socket handoff:** What exactly is needed to safely mount and access a newly created Baffle Unix socket across nested namespaces and UID mappings?
-3. **Profile configuration and reload:** Phase 1 resolves profile and migration choices: TOML profiles use the sibling `filesystems/` directory, version 1, strict direct paths, and a SHA-256 fingerprint across Rego and profile contents; each valid reload publishes both together. Baffle selections are single `.toml` filenames whose contents remain daemon-managed. Existing boolean policies require migration to `data.sandbox.main.decision`.
-4. **Quotas and execution limits:** Decide whether timeouts, memory, CPU, process limits and maximum tmpfs sizes belong in this proposal or a subsequent policy extension.
+1. **Baffle transport — resolved:** Gantry uses the pinned `baffle-client` API to create a file-selected ephemeral session over the trusted control UDS. This phase does not add a separate broker or a general network-provider API.
+2. **Socket handoff — resolved:** Gantry checks that the returned socket is absolute, is within the configured session socket directory, is unique among active executions, and is a live Unix socket. It pins and mounts only that socket. The Bubblewrap/Baffle integration suite verifies HTTPS routing and absence of control, sibling-session, and secret paths.
+3. **Profile configuration and reload — resolved:** TOML profiles use the sibling `filesystems/` directory, version 1, strict direct paths, and a SHA-256 fingerprint across Rego and profile contents. Each valid reload publishes both together. Baffle selections are single `.toml` filenames whose contents remain daemon-managed. Existing boolean policies require migration to `data.sandbox.main.decision`.
+4. **Quotas and execution limits — deferred:** Time, memory, CPU, and PID quotas remain outside this proposal. A later proposal can define operator-configured limits without changing the structured decision contract. Tmpfs sizes remain bounded by their validated profile values.
+
+### Phase 4 release evidence
+
+The release suite maps the final criteria to repeatable checks:
+
+| Criterion | Automated evidence |
+| --- | --- |
+| End-to-end MCP, `/raw`, `/check`, and `run-remote --check` over TCP and UDS with Direct and Bubblewrap | `tests/end_to_end.rs::server_transport_backend_matrix` starts the actual server and exercises all four surfaces across the transport/backend matrix. Bubblewrap cases run in the required Podman job. |
+| Filesystem, network, socket visibility, concurrency, descendant cleanup, and parent termination | `executor::tests::bubblewrap_runs_elf_command_with_restricted_runtime_and_private_tmp`, `tests/baffle_live.rs::bubblewrap_routes_only_through_distinct_file_backed_baffle_sessions`, and `tests/end_to_end.rs::gantry_parent_termination_stops_bubblewrap_descendants`. |
+| Baffle creation and bridge failures, mount failures, startup errors, cancellation, and lease release | `tests/baffle_live.rs` failure-path tests, `gantry_supervisor` bridge tests, Bubblewrap setup tests in `executor.rs`, and raw disconnect tests in `raw.rs`. |
+| Policy reload and invalid-profile behavior | `policy::tests::reload_transitions_invalid_to_deny_all_and_recovers`, `policy::tests::invalid_profile_reload_activates_deny_all`, and `tests/policy_reload.rs`. |
+| Required Linux isolation CI with check name `test` | `.github/workflows/ci.yml` runs format, build, Clippy, host tests, and the required Bubblewrap/Baffle suite with `GANTRY_REQUIRE_BUBBLEWRAP_TESTS=1` inside privileged Podman. |
+| Safe diagnostics and migration guidance | `tests/end_to_end.rs::server_transport_backend_matrix` checks that request arguments do not appear in logs and that execution/cleanup outcomes are logged. `tests/end_to_end.rs::baffle_diagnostics_report_session_identity_without_request_secrets` checks that logs include the selected Baffle filename and session identity without request credentials. README, `src/main.rs --help`, and `docs/cwd-policy-guarantees.md` document the contracts and migration. |
+
+The Bubblewrap suite is mandatory in the target CI environment. A local run without namespace support may omit Bubblewrap cases; setting `GANTRY_REQUIRE_BUBBLEWRAP_TESTS=1` converts a missing capability into a test failure.
 
 ## Final acceptance criteria
 

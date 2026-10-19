@@ -45,7 +45,14 @@ struct ProxyBridge {
 
 impl ProxyBridge {
     async fn start(socket_path: PathBuf) -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:3128").await?;
+        Self::start_on(socket_path, "127.0.0.1:3128").await
+    }
+
+    async fn start_on(
+        socket_path: PathBuf,
+        address: impl tokio::net::ToSocketAddrs,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(address).await?;
         let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(serve_proxy_connections(listener, socket_path, receiver));
         Ok(Self {
@@ -270,6 +277,20 @@ fn terminate_sandbox_descendants(command_pid: i32) {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn proxy_bridge_start_failure_is_reported_when_the_port_is_in_use() {
+        let occupied = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("occupy a loopback port");
+        let address = occupied.local_addr().expect("occupied address");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let error = ProxyBridge::start_on(directory.path().join("proxy.sock"), address)
+            .await
+            .err()
+            .expect("the occupied port must prevent bridge startup");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
 
     #[tokio::test]
     async fn bridge_opens_one_uds_connection_for_each_tcp_client() {
