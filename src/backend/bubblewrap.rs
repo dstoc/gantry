@@ -214,6 +214,7 @@ mod linux {
         }
 
         let mut command = Command::new(&bubblewrap);
+        let use_baffle_proxy = baffle_lease.is_some();
         build_bubblewrap_args(&mut command, &mounts, profile);
         command
             .arg("--")
@@ -244,14 +245,16 @@ mod linux {
             });
         }
 
-        let mut child = command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             StartError::Setup(format!("failed to start Bubblewrap launcher: {error}"))
         })?;
+        let mut execution = RunningExecution::new_starting(child, true, baffle_lease.take());
         drop(inherited_mount_fds);
         drop(mounts);
 
         let stdin_result = async {
-            let mut stdin = child
+            let mut stdin = execution
+                .child_mut()
                 .stdin
                 .take()
                 .ok_or_else(|| io::Error::other("Bubblewrap launcher stdin pipe is missing"))?;
@@ -260,7 +263,7 @@ mod linux {
                 args: &plan.invocation.args,
                 cwd: &plan.invocation.cwd,
                 environment: &plan.invocation.environment,
-                proxy_socket: baffle_lease.as_ref().map(|_| Path::new(SANDBOX_SOCKET)),
+                proxy_socket: use_baffle_proxy.then_some(Path::new(SANDBOX_SOCKET)),
             };
             let bytes = serde_json::to_vec(&message)
                 .map_err(|error| io::Error::other(error.to_string()))?;
@@ -269,16 +272,16 @@ mod linux {
         }
         .await;
         if let Err(error) = stdin_result {
-            terminate_launcher(&mut child).await;
+            terminate_launcher(execution.child_mut()).await;
             return Err(StartError::Setup(format!(
                 "failed to send the authorized invocation to the Bubblewrap supervisor: {error}"
             )));
         }
 
-        let stdout = match child.stdout.take() {
+        let stdout = match execution.child_mut().stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(
                     "Bubblewrap supervisor stdout pipe is missing".to_string(),
                 ));
@@ -289,7 +292,7 @@ mod linux {
         let read_result = status_reader.read_line(&mut line).await;
         let status = match read_result {
             Ok(0) => {
-                let diagnostics = launcher_diagnostics(&mut child).await;
+                let diagnostics = launcher_diagnostics(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap exited before the authorized command started{diagnostics}"
                 )));
@@ -297,14 +300,14 @@ mod linux {
             Ok(_) => match serde_json::from_str::<SupervisorMessage>(&line) {
                 Ok(status) => status,
                 Err(error) => {
-                    terminate_launcher(&mut child).await;
+                    terminate_launcher(execution.child_mut()).await;
                     return Err(StartError::Setup(format!(
                         "Bubblewrap supervisor returned an invalid startup status: {error}"
                     )));
                 }
             },
             Err(error) => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "failed to read Bubblewrap supervisor startup status: {error}"
                 )));
@@ -313,13 +316,13 @@ mod linux {
         match status {
             SupervisorMessage::Started => {}
             SupervisorMessage::SetupError { error } => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap command startup failed: {error}"
                 )));
             }
             _ => {
-                terminate_launcher(&mut child).await;
+                terminate_launcher(execution.child_mut()).await;
                 return Err(StartError::Setup(
                     "Bubblewrap supervisor returned an unexpected startup status".to_string(),
                 ));
@@ -340,27 +343,13 @@ mod linux {
             let _ = final_status_tx.send(result);
         });
         let stdout: crate::execution::OutputReader = Box::new(stdout_reader);
-        let stderr = child
+        let stderr = execution
+            .child_mut()
             .stderr
             .take()
             .map(|reader| Box::new(reader) as crate::execution::OutputReader);
-        Ok(match baffle_lease {
-            Some(lease) => RunningExecution::new_with_streams_and_baffle_lease(
-                child,
-                true,
-                Some(stdout),
-                stderr,
-                final_status_rx,
-                lease,
-            ),
-            None => RunningExecution::new_with_streams(
-                child,
-                true,
-                Some(stdout),
-                stderr,
-                final_status_rx,
-            ),
-        })
+        execution.set_streams(Some(stdout), stderr, final_status_rx);
+        Ok(execution)
     }
 
     async fn forward_supervisor_output<R, W>(
@@ -755,6 +744,7 @@ pub(super) use linux::start;
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn start(
     _plan: crate::execution::ExecutionPlan,
+    _baffle: crate::baffle::BaffleRuntimeConfig,
 ) -> Result<crate::execution::RunningExecution, crate::backend::StartError> {
     Err(crate::backend::StartError::Setup(
         "Bubblewrap execution is supported only on Linux".to_string(),

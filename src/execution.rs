@@ -153,9 +153,6 @@ type FinalStatusReceiver = oneshot::Receiver<Result<ExecutionExitStatus, io::Err
 
 impl RunningExecution {
     pub(crate) fn new(mut child: Child, terminate_process_group: bool) -> Self {
-        let process_group = terminate_process_group
-            .then(|| child.id().map(|pid| pid as i32))
-            .flatten();
         let stdout = child
             .stdout
             .take()
@@ -164,23 +161,16 @@ impl RunningExecution {
             .stderr
             .take()
             .map(|reader| Box::new(reader) as OutputReader);
-        Self {
-            child,
-            process_group,
-            stdout,
-            stderr,
-            final_status: None,
-            completed_status: None,
-            baffle_lease: None,
-        }
+        let mut execution = Self::new_starting(child, terminate_process_group, None);
+        execution.stdout = stdout;
+        execution.stderr = stderr;
+        execution
     }
 
-    pub(crate) fn new_with_streams(
+    pub(crate) fn new_starting(
         child: Child,
         terminate_process_group: bool,
-        stdout: Option<OutputReader>,
-        stderr: Option<OutputReader>,
-        final_status: FinalStatusReceiver,
+        baffle_lease: Option<crate::baffle::BaffleSessionLease>,
     ) -> Self {
         let process_group = terminate_process_group
             .then(|| child.id().map(|pid| pid as i32))
@@ -188,26 +178,27 @@ impl RunningExecution {
         Self {
             child,
             process_group,
-            stdout,
-            stderr,
-            final_status: Some(final_status),
+            stdout: None,
+            stderr: None,
+            final_status: None,
             completed_status: None,
-            baffle_lease: None,
+            baffle_lease,
         }
     }
 
-    pub(crate) fn new_with_streams_and_baffle_lease(
-        child: Child,
-        terminate_process_group: bool,
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn set_streams(
+        &mut self,
         stdout: Option<OutputReader>,
         stderr: Option<OutputReader>,
         final_status: FinalStatusReceiver,
-        baffle_lease: crate::baffle::BaffleSessionLease,
-    ) -> Self {
-        let mut execution =
-            Self::new_with_streams(child, terminate_process_group, stdout, stderr, final_status);
-        execution.baffle_lease = Some(baffle_lease);
-        execution
+    ) {
+        self.stdout = stdout;
+        self.stderr = stderr;
+        self.final_status = Some(final_status);
     }
 
     pub(crate) fn take_stdout(&mut self) -> Option<OutputReader> {
@@ -299,6 +290,27 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    struct ReadObserved<R> {
+        inner: R,
+        first_poll: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[cfg(unix)]
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadObserved<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(sender) = this.first_poll.take() {
+                let _ = sender.send(());
+            }
+            std::pin::Pin::new(&mut this.inner).poll_read(context, buffer)
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn execution_status_keeps_signal_distinct_from_exit_code() {
         let signaled =
@@ -315,6 +327,123 @@ mod tests {
     fn rejects_ambiguous_execution_status() {
         assert!(ExecutionExitStatus::from_components(None, None).is_err());
         assert!(ExecutionExitStatus::from_components(Some(128), Some(15)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_startup_waits_for_launcher_exit_before_releasing_baffle_lease() {
+        use std::process::Stdio;
+
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::process::Command;
+        use tokio::time::{Duration, timeout};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let control_path = directory.path().join("control.sock");
+        let session_path = directory.path().join("assigned.sock");
+        let control_listener = UnixListener::bind(&control_path).expect("control listener");
+        let _session_listener = UnixListener::bind(&session_path).expect("session listener");
+        let response_socket = session_path.clone();
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = control_listener
+                .accept()
+                .await
+                .expect("Baffle client connects");
+            let mut header = [0; 4];
+            stream
+                .read_exact(&mut header)
+                .await
+                .expect("read request length");
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("read create request");
+            let response = serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "ok": true,
+                "result": {
+                    "id": "startup-cancellation-session",
+                    "socket": response_socket,
+                    "persistent": false
+                }
+            }))
+            .expect("response JSON");
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .await
+                .expect("write response length");
+            stream.write_all(&response).await.expect("write response");
+
+            let mut byte = [0; 1];
+            assert_eq!(
+                stream.read(&mut byte).await.expect("read lease closure"),
+                0,
+                "the session lease should close after startup cleanup"
+            );
+            let pid = pid_rx.await.expect("launcher PID");
+            let launcher_alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+            closed_tx
+                .send(launcher_alive)
+                .expect("report lease close ordering");
+        });
+
+        let lease = crate::baffle::create_ephemeral_session(
+            &crate::baffle::BaffleRuntimeConfig {
+                control_socket: control_path,
+                session_socket_dir: directory.path().to_path_buf(),
+                ca_certificate: None,
+            },
+            "startup-test.toml",
+        )
+        .await
+        .expect("create mock Baffle session");
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start paused launcher");
+        let pid = child.id().expect("launcher PID");
+        pid_tx
+            .send(pid)
+            .expect("provide launcher PID to mock daemon");
+
+        let (status_read_tx, status_read_rx) = tokio::sync::oneshot::channel();
+        let startup = tokio::spawn(async move {
+            let mut execution = RunningExecution::new_starting(child, true, Some(lease));
+            let stdout = execution
+                .child_mut()
+                .stdout
+                .take()
+                .expect("launcher status pipe");
+            let mut status_reader = BufReader::new(ReadObserved {
+                inner: stdout,
+                first_poll: Some(status_read_tx),
+            });
+            let mut line = String::new();
+            let _ = status_reader.read_line(&mut line).await;
+        });
+
+        timeout(Duration::from_secs(3), status_read_rx)
+            .await
+            .expect("startup reached its first status read")
+            .expect("status reader poll notification");
+        startup.abort();
+        let _ = startup.await;
+
+        let launcher_alive_when_lease_closed = timeout(Duration::from_secs(3), closed_rx)
+            .await
+            .expect("mock daemon observed lease close")
+            .expect("report launcher state");
+        assert!(
+            !launcher_alive_when_lease_closed,
+            "launcher must be reaped before the Baffle lease closes"
+        );
+        daemon.await.expect("mock daemon task");
     }
 
     #[test]
