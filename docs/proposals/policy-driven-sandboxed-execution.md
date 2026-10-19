@@ -276,16 +276,26 @@ trait ExecutionBackend {
 
 The `--backend` startup option selects the backend for the Gantry instance; default `bubblewrap`, explicit opt-in `direct`. Rego never selects it. Direct keeps the current `tokio::process::Command` behavior. Unsupported policy requirements cause an error, and failed Bubblewrap execution never falls back to Direct.
 
-### Backend selection matrix
+### Backend selection and compatibility
 
-| Filesystem decision | Baffle session | Backend | Result |
+The operator selects a single backend for the Gantry instance:
+
+```sh
+gantry                         # bubblewrap (default)
+gantry --backend bubblewrap    # explicit sandboxing
+gantry --backend direct        # opt into current direct execution
+```
+
+| CLI backend | Rego `filesystem` | Rego `baffle_session` | Result |
 | --- | --- | --- | --- |
-| Named profile | null | Bubblewrap | Isolated; no external network |
-| Named profile | filename | Bubblewrap | Isolated; per-command Baffle proxy |
-| null | null | Direct | Current Gantry command execution, if enabled |
-| null | filename | Denied | Direct does not support per-command Baffle sessions |
+| `bubblewrap` | Named profile | `null` | Isolated, no external network |
+| `bubblewrap` | Named profile | Baffle filename | Isolated, Baffle networking |
+| `bubblewrap` | `null` | Any | Error |
+| `direct` | `null` | `null` | Existing unsandboxed execution |
+| `direct` | Named profile | Any | Error |
+| `direct` | `null` | Baffle filename | Error |
 
-Direct is a deliberate policy selection; no backend failure changes a named filesystem decision into Direct.
+The backend does not change per command. An unsupported policy requirement fails before spawn; never retry with a different backend.
 
 Use capability validation before provisioning. Concurrent runs must each retain their own immutable policy/profile snapshot and execution ownership.
 
