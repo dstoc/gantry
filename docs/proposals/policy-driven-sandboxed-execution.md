@@ -255,9 +255,9 @@ Gantry uses Baffle's existing `baffle-client` and `create_from_file` operation d
 
 Trusted Gantry execution state holds the ephemeral session lease for the complete command/process-tree lifetime, releasing it on success, cancellation, spawn failure and unexpected termination. Only the assigned Baffle **data** socket is exposed inside the sandbox; never the control socket or credentials.
 
-### No session means no external network
+### No Baffle session in Bubblewrap
 
-With `baffle_session: null`, the command still runs in an isolated network namespace, without an external route, any Baffle socket, or injected proxy configuration. Private loopback may be used within the invocation. Caller-supplied proxy and bypass environment variables cannot override this restriction.
+With `filesystem` set to a named profile and `baffle_session: null`, the command runs in an isolated network namespace, without an external route, any Baffle socket, or injected proxy configuration. Private loopback may be used within the invocation. Caller-supplied proxy and bypass environment variables cannot override this restriction.
 
 ## 4. Pluggable execution backends
 
