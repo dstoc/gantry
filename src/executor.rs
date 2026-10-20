@@ -1313,6 +1313,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         }));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bubblewrap_setup_failure_never_falls_back_to_direct() {
         let true_path = find_executable("true").expect("true executable");
