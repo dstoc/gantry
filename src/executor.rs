@@ -443,7 +443,7 @@ fn resolve_authorized_cwd(
     resolve_authorized_cwd_absolute(effective_input)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_authorized_cwd_absolute(
     effective_input: PathBuf,
 ) -> Result<AuthorizedCwd, ValidationError> {
@@ -461,10 +461,14 @@ fn resolve_authorized_cwd_absolute(
 
     fn open_root() -> Result<OwnedFd, std::io::Error> {
         let root = CString::new("/").expect("static path has no nul");
+        #[cfg(target_os = "linux")]
+        let directory_flag = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let directory_flag = libc::O_RDONLY;
         let fd = unsafe {
             libc::open(
                 root.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                directory_flag | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -481,11 +485,15 @@ fn resolve_authorized_cwd_absolute(
                 "cwd component contains a nul byte",
             )
         })?;
+        #[cfg(target_os = "linux")]
+        let directory_flag = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let directory_flag = libc::O_RDONLY | libc::O_DIRECTORY;
         let fd = unsafe {
             libc::openat(
                 parent_fd,
                 component.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                directory_flag | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -558,7 +566,7 @@ fn resolve_authorized_cwd_absolute(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_authorized_cwd_absolute(
     effective_input: PathBuf,
 ) -> Result<AuthorizedCwd, ValidationError> {
