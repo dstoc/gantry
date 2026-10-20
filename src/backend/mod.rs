@@ -16,6 +16,13 @@ pub(crate) enum StartError {
     StartupTimeout { timeout: Duration },
 }
 
+pub(crate) fn initialize(backend: ExecutionBackend) -> Result<(), String> {
+    match backend {
+        ExecutionBackend::Direct => Ok(()),
+        ExecutionBackend::Bubblewrap => bubblewrap::initialize(),
+    }
+}
+
 pub(crate) async fn start(
     plan: ExecutionPlan,
     trusted_cwd_fd: RawFd,

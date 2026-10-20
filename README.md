@@ -190,6 +190,8 @@ Bind access must be `read-only` or `read-write`. Tmpfs sizes must be positive an
 
 Bubblewrap automatically exposes the authorized executable and supervisor, each ELF `PT_INTERP` interpreter, recursively required `DT_NEEDED` libraries, and direct script shebang interpreters. It reads ELF metadata without running the authorized command on the host. It does not search `PATH` for commands named by `/usr/bin/env`, inspect commands a workload starts later, or discover `dlopen` libraries and plugins. RPATH or RUNPATH libraries are used only when a selected filesystem profile exposes their source.
 
+When the server starts with the Bubblewrap backend, Gantry checks the installed Bubblewrap version and required options once. It also discovers the host library directories and, when available, the `ldconfig -p` cache. Gantry reuses that runtime metadata for 60 seconds and refreshes it before a later execution after the cache expires. A failed refresh fails that execution and a later request retries. If `ldconfig` is missing or fails, Gantry uses the discovered library directories without its cache. Restart the server after replacing Bubblewrap to refresh its cached capability check. Runtime metadata only helps locate dependencies: each execution still applies the current policy decision and filesystem profile, checks selected sources, and pins the dependencies it will mount.
+
 Administrators can add exact paths to a filesystem profile with the optional `runtime_paths` array:
 
 ```toml
