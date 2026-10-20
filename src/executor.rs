@@ -1928,9 +1928,9 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             missing_helper.stderr
         );
 
-        let runtime_paths = vec![python.clone(), python_stdlib];
+        let runtime_paths = vec![python.clone(), python_stdlib.clone()];
         write_profile(&runtime_paths);
-        let engine = PolicyEngine::from_sources(Some(policy_dir));
+        let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
 
         let env_python = run_command_with_backend(
             &engine,
@@ -1953,7 +1953,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             &cwd,
             ExecutionBackend::Bubblewrap,
             RunCommandInput {
-                executable: python,
+                executable: python.clone(),
                 args: vec!["-c".to_string(), "print('python-direct-ok')".to_string()],
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 env: None,
@@ -1965,6 +1965,39 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         assert_eq!(direct_python.exit_code, Some(0), "{}", direct_python.stderr);
 
         let node = tools.iter().find(|(name, _)| *name == "node").unwrap();
+        let node_builtin = PathBuf::from("/usr/share/nodejs/cjs-module-lexer/lexer.js");
+        if node_builtin.is_file() {
+            let node_without_builtin = run_command_with_backend(
+                &engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                RunCommandInput {
+                    executable: node.1.clone(),
+                    args: vec![
+                        "-e".to_string(),
+                        "process.stdout.write('node-ok')".to_string(),
+                    ],
+                    cwd: Some(workspace.to_string_lossy().into_owned()),
+                    env: None,
+                },
+            )
+            .await
+            .expect("Node without its selected builtin is a command failure");
+            if node_without_builtin.exit_code != Some(0) {
+                assert!(
+                    node_without_builtin
+                        .stderr
+                        .contains("/usr/share/nodejs/cjs-module-lexer/lexer.js"),
+                    "missing Node builtin should be identified clearly: {node_without_builtin:?}"
+                );
+            }
+            write_profile(&[
+                python.clone(),
+                python_stdlib.clone(),
+                node_builtin.to_string_lossy().into_owned(),
+            ]);
+        }
+        let engine = PolicyEngine::from_sources(Some(policy_dir));
         let node_output = run_command_with_backend(
             &engine,
             &cwd,

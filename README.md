@@ -202,6 +202,8 @@ Each entry must resolve to a regular file or directory. Gantry mounts it read-on
 
 For `#!/usr/bin/env python3`, Gantry discovers `/usr/bin/env` as the script interpreter. The profile must also expose the `python3` executable at a location in the command `PATH`, plus any required standard-library or module directories. The exact paths depend on the installed distribution. If the profile omits `python3`, `env` exits with an error; Gantry does not widen the runtime or switch to Direct. The same rule applies to helpers used by Python, Node, Git, `gh`, and Cargo. When one of these tools is the authorized command, Gantry adds that executable and its ELF dependencies automatically. Other tools and plugin paths must be selected in `runtime_paths`.
 
+Some Node packages also store built-in JavaScript modules outside the Node executable. For example, Debian's Node package can require `/usr/share/nodejs/cjs-module-lexer/lexer.js`. Add the exact file to `runtime_paths` when the selected Node package reports that it cannot load this externalized builtin. Gantry does not scan the Node installation or expose `/usr/share/nodejs` automatically.
+
 ### Migrating from the Boolean Contract
 
 Replace `data.sandbox.main.allow` with `data.sandbox.main.decision`. A Direct deployment returns explicit `filesystem: null` and `baffle_session: null` fields, and uses `--backend direct` when selecting the backend explicitly. Bubblewrap policies select a named profile from the administrator-managed `filesystems/` directory.
