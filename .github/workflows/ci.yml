@@ -4,6 +4,25 @@ on:
   pull_request:
 
 jobs:
+  test-macos:
+    name: test (macOS)
+    runs-on: macos-14
+    env:
+      TMPDIR: /private/tmp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: |
+          set +e
+          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            summary="$(tail -n 80 "$RUNNER_TEMP/cargo-test.log" | tr '\n' ' ' | tr -d '\r' | sed 's/%/%25/g')"
+            echo "::error title=macOS cargo test failure::$summary"
+          fi
+          exit "$test_status"
+
   test:
     name: test
     runs-on: ubuntu-24.04

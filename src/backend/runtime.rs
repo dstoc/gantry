@@ -581,6 +581,7 @@ fn resolve_library(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn discovers_a_real_elf_runtime_and_script_interpreter() {
         let profile = FilesystemProfile {
