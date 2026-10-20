@@ -24,6 +24,13 @@ pub enum FilesystemProfileError {
 pub(crate) struct FilesystemProfile {
     pub(crate) name: String,
     pub(crate) mounts: Vec<FilesystemMount>,
+    pub(crate) runtime_paths: Vec<RuntimePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimePath {
+    pub(crate) source: PathBuf,
+    pub(crate) target: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +57,8 @@ pub(crate) enum MountAccess {
 struct ProfileDocument {
     version: u32,
     mounts: Vec<MountDocument>,
+    #[serde(default)]
+    runtime_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,9 +227,57 @@ fn load_profile(path: &Path, contents: &[u8]) -> Result<FilesystemProfile, Files
         }
     }
 
+    let mut runtime_paths: Vec<RuntimePath> = Vec::with_capacity(document.runtime_paths.len());
+    for value in document.runtime_paths {
+        let target = validate_absolute_path(&value, "runtime path")
+            .map_err(|details| invalid(path, details))?;
+        validate_runtime_target(&target).map_err(|details| invalid(path, details))?;
+        let source = fs::canonicalize(&target).map_err(|error| {
+            invalid(
+                path,
+                format!(
+                    "runtime path '{}' cannot be resolved: {error}",
+                    target.display()
+                ),
+            )
+        })?;
+        validate_mount_source(&source).map_err(|details| invalid(path, details))?;
+        for mount in &mounts {
+            let mount_target = match mount {
+                FilesystemMount::Bind { target, .. } | FilesystemMount::Tmpfs { target, .. } => {
+                    target
+                }
+            };
+            if paths_overlap(mount_target, &target) {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "runtime path '{}' overlaps filesystem mount destination '{}'",
+                        target.display(),
+                        mount_target.display()
+                    ),
+                ));
+            }
+        }
+        for previous in &runtime_paths {
+            if paths_overlap(previous.target.as_path(), &target) {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "runtime paths overlap: '{}' and '{}'",
+                        previous.target.display(),
+                        target.display()
+                    ),
+                ));
+            }
+        }
+        runtime_paths.push(RuntimePath { source, target });
+    }
+
     Ok(FilesystemProfile {
         name: name.to_string(),
         mounts,
+        runtime_paths,
     })
 }
 
@@ -353,6 +410,22 @@ fn validate_mount_target(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_runtime_target(target: &Path) -> Result<(), String> {
+    const PROTECTED: &[&str] = &["/dev", "/proc", "/run", "/sys"];
+    if target == Path::new("/")
+        || PROTECTED
+            .iter()
+            .map(Path::new)
+            .any(|protected| paths_overlap(target, protected))
+    {
+        return Err(format!(
+            "runtime path destination '{}' is protected",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -430,6 +503,103 @@ mod tests {
         ));
         assert!(
             matches!(profile.mounts[1], FilesystemMount::Tmpfs { size_bytes, .. } if size_bytes == 256 * 1024 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_read_only_runtime_paths_and_resolves_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let filesystem_dir = root.path().join("filesystems");
+        let helper = root.path().join("python3");
+        let helper_alias = root.path().join("python");
+        let library_dir = root.path().join("python-stdlib");
+        fs::write(&helper, "fixture").expect("write helper");
+        symlink(&helper, &helper_alias).expect("create helper alias");
+        fs::create_dir(&library_dir).expect("create library directory");
+        write_profile(
+            &filesystem_dir,
+            "runtime",
+            &format!(
+                "version = 1\nruntime_paths = [{:?}, {:?}]\n\nmounts = []\n",
+                helper_alias.to_string_lossy(),
+                library_dir.to_string_lossy(),
+            ),
+        );
+
+        let profiles = load_profiles(&filesystem_dir).expect("valid runtime paths");
+        let profile = profiles.get("runtime").expect("profile entry");
+        assert_eq!(profile.runtime_paths.len(), 2);
+        assert_eq!(profile.runtime_paths[0].source, helper);
+        assert_eq!(profile.runtime_paths[0].target, helper_alias);
+        assert_eq!(profile.runtime_paths[1].source, library_dir);
+        assert_eq!(profile.runtime_paths[1].target, library_dir);
+    }
+
+    #[test]
+    fn rejects_invalid_and_overlapping_runtime_paths() {
+        let root = tempfile::tempdir().expect("temp root");
+        let filesystem_dir = root.path().join("filesystems");
+        let directory = root.path().join("python");
+        fs::create_dir(&directory).expect("create runtime directory");
+        let nested = directory.join("stdlib");
+        fs::create_dir(&nested).expect("create nested runtime directory");
+
+        for (name, paths, expected) in [
+            ("relative-runtime", "[\"python3\"]", "absolute"),
+            (
+                "missing-runtime",
+                "[\"/no/such/gantry-runtime-path\"]",
+                "cannot be resolved",
+            ),
+            (
+                "traversal-runtime",
+                "[\"/usr/bin/../bin/python3\"]",
+                "empty, . or ..",
+            ),
+            ("protected-runtime", "[\"/proc\"]", "is protected"),
+        ] {
+            write_profile(
+                &filesystem_dir,
+                name,
+                &format!("version = 1\nruntime_paths = {paths}\nmounts = []\n"),
+            );
+            let error = load_profiles(&filesystem_dir).expect_err("invalid runtime path rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+            fs::remove_file(filesystem_dir.join(format!("{name}.toml"))).expect("remove profile");
+        }
+
+        write_profile(
+            &filesystem_dir,
+            "overlapping-runtime",
+            &format!(
+                "version = 1\nruntime_paths = [{:?}, {:?}]\nmounts = []\n",
+                directory.to_string_lossy(),
+                nested.to_string_lossy(),
+            ),
+        );
+        let error = load_profiles(&filesystem_dir).expect_err("overlapping paths rejected");
+        assert!(error.to_string().contains("runtime paths overlap"));
+
+        fs::remove_file(filesystem_dir.join("overlapping-runtime.toml"))
+            .expect("remove overlapping profile");
+        write_profile(
+            &filesystem_dir,
+            "runtime-mount-overlap",
+            &format!(
+                "version = 1\nruntime_paths = [{:?}]\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
+                directory.to_string_lossy(),
+                directory.to_string_lossy(),
+                directory.to_string_lossy(),
+            ),
+        );
+        let error = load_profiles(&filesystem_dir).expect_err("runtime mount overlap rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps filesystem mount destination")
         );
     }
 

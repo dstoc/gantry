@@ -57,10 +57,15 @@ impl BaffleRuntimeConfig {
             protected_paths.push(socket.parent().unwrap_or(Path::new("/")).to_path_buf());
         }
 
-        for mount in &profile.mounts {
-            let FilesystemMount::Bind { source, .. } = mount else {
-                continue;
-            };
+        let profile_sources = profile
+            .runtime_paths
+            .iter()
+            .map(|runtime_path| runtime_path.source.as_path())
+            .chain(profile.mounts.iter().filter_map(|mount| match mount {
+                FilesystemMount::Bind { source, .. } => Some(source.as_path()),
+                FilesystemMount::Tmpfs { .. } => None,
+            }));
+        for source in profile_sources {
             let source = canonicalize_or_original(source);
             for protected in &protected_paths {
                 let protected = canonicalize_or_original(protected);
@@ -247,6 +252,7 @@ mod tests {
                 target: "/workspace".into(),
                 access: crate::filesystem::MountAccess::ReadOnly,
             }],
+            runtime_paths: Vec::new(),
         };
         let config = BaffleRuntimeConfig {
             control_socket: baffle_dir.join("control.sock"),
@@ -255,6 +261,29 @@ mod tests {
         let error = config
             .validate_profile_sources(&profile, None)
             .expect_err("parent mount must not expose Baffle state");
+        assert!(error.contains("protected Baffle runtime path"));
+    }
+
+    #[test]
+    fn rejects_runtime_paths_that_expose_baffle_runtime_directories() {
+        let root = tempfile::tempdir().expect("test root");
+        let control_dir = root.path().join("control");
+        std::fs::create_dir_all(&control_dir).expect("control directory");
+        let profile = FilesystemProfile {
+            name: "runtime".to_string(),
+            mounts: Vec::new(),
+            runtime_paths: vec![crate::filesystem::RuntimePath {
+                source: control_dir.clone(),
+                target: control_dir.clone(),
+            }],
+        };
+        let config = BaffleRuntimeConfig {
+            control_socket: control_dir.join("control.sock"),
+        };
+
+        let error = config
+            .validate_profile_sources(&profile, None)
+            .expect_err("runtime path must not expose Baffle state");
         assert!(error.contains("protected Baffle runtime path"));
     }
 
@@ -272,6 +301,7 @@ mod tests {
                 target: "/workspace/sessions".into(),
                 access: crate::filesystem::MountAccess::ReadOnly,
             }],
+            runtime_paths: Vec::new(),
         };
         let config = BaffleRuntimeConfig {
             control_socket: control_dir.join("control.sock"),

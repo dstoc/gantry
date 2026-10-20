@@ -11,6 +11,12 @@ pub(super) struct RuntimeFile {
     pub(super) target: PathBuf,
 }
 
+struct PendingFile {
+    path: PathBuf,
+    expose_at_path: bool,
+    allow_opaque: bool,
+}
+
 /// Find the command, its script or ELF interpreter, its ELF shared libraries,
 /// and the same requirements for the trusted supervisor. This reads ELF data
 /// directly and never runs the authorized executable on the host.
@@ -21,11 +27,56 @@ pub(super) fn runtime_files(
 ) -> Result<Vec<RuntimeFile>, String> {
     let mut files = BTreeMap::<PathBuf, PathBuf>::new();
     let mut inspected = BTreeSet::<PathBuf>::new();
-    let mut pending = VecDeque::from([executable.to_path_buf(), supervisor.to_path_buf()]);
+    let mut pending = VecDeque::from([
+        PendingFile {
+            path: executable.to_path_buf(),
+            expose_at_path: true,
+            allow_opaque: false,
+        },
+        PendingFile {
+            path: supervisor.to_path_buf(),
+            expose_at_path: true,
+            allow_opaque: false,
+        },
+    ]);
     let default_library_dirs = library_directories();
     let cache = linker_cache();
 
-    while let Some(path) = pending.pop_front() {
+    for runtime_path in &profile.runtime_paths {
+        let metadata = fs::metadata(&runtime_path.source).map_err(|error| {
+            format!(
+                "failed to inspect selected runtime path '{}': {error}",
+                runtime_path.target.display()
+            )
+        })?;
+        insert_runtime_file(
+            &mut files,
+            runtime_path.target.clone(),
+            runtime_path.source.clone(),
+        )?;
+        if metadata.is_file() {
+            pending.push_back(PendingFile {
+                path: runtime_path.source.clone(),
+                expose_at_path: false,
+                allow_opaque: true,
+            });
+        } else if !metadata.is_dir() {
+            return Err(format!(
+                "selected runtime path '{}' is no longer a regular file or directory",
+                runtime_path.target.display()
+            ));
+        }
+    }
+
+    while let Some(pending_file) = pending.pop_front() {
+        if pending_file.expose_at_path {
+            insert_runtime_file(
+                &mut files,
+                pending_file.path.clone(),
+                pending_file.path.clone(),
+            )?;
+        }
+        let path = pending_file.path;
         if !inspected.insert(path.clone()) {
             continue;
         }
@@ -39,11 +90,17 @@ pub(super) fn runtime_files(
             let interpreter = parse_shebang(&bytes)
                 .map_err(|details| format!("invalid shebang in '{}': {details}", path.display()))?;
             ensure_runtime_interpreter(&interpreter, profile, &default_library_dirs)?;
-            insert_runtime_file(&mut files, path.clone(), path.clone())?;
-            pending.push_back(interpreter);
+            pending.push_back(PendingFile {
+                path: interpreter,
+                expose_at_path: true,
+                allow_opaque: false,
+            });
             continue;
         }
         if !bytes.starts_with(b"\x7fELF") {
+            if pending_file.allow_opaque {
+                continue;
+            }
             return Err(format!(
                 "runtime file '{}' is neither an ELF executable nor a script with a shebang",
                 path.display()
@@ -53,10 +110,13 @@ pub(super) fn runtime_files(
         let elf = parse_elf(&bytes).map_err(|details| {
             format!("cannot inspect ELF file '{}': {details}", path.display())
         })?;
-        insert_runtime_file(&mut files, path.clone(), path.clone())?;
         if let Some(interpreter) = elf.interpreter {
             ensure_runtime_interpreter(&interpreter, profile, &default_library_dirs)?;
-            pending.push_back(interpreter);
+            pending.push_back(PendingFile {
+                path: interpreter,
+                expose_at_path: true,
+                allow_opaque: false,
+            });
         }
         let mut search_dirs = Vec::new();
         search_dirs.extend(
@@ -64,7 +124,6 @@ pub(super) fn runtime_files(
                 .iter()
                 .map(|entry| expand_origin(entry, &path)),
         );
-        search_dirs.retain(|directory| profile_exposes_path(profile, directory));
         search_dirs.extend(default_library_dirs.iter().cloned());
         for needed in elf.needed {
             let dependency = if needed.contains('/') {
@@ -96,7 +155,11 @@ pub(super) fn runtime_files(
                     )
                 })?
             };
-            pending.push_back(dependency);
+            pending.push_back(PendingFile {
+                path: dependency,
+                expose_at_path: true,
+                allow_opaque: false,
+            });
         }
     }
 
@@ -114,13 +177,15 @@ fn insert_runtime_file(
     if !target.is_absolute() || !source.is_absolute() {
         return Err("runtime files must use absolute paths".to_string());
     }
-    if let Some(existing) = files.insert(target.clone(), source.clone())
-        && existing != source
-    {
-        return Err(format!(
-            "runtime path '{}' maps to conflicting files",
-            target.display()
-        ));
+    if let Some(existing) = files.get(&target) {
+        if fs::canonicalize(existing).ok() != fs::canonicalize(&source).ok() {
+            return Err(format!(
+                "runtime path '{}' maps to conflicting files",
+                target.display()
+            ));
+        }
+    } else {
+        files.insert(target, source);
     }
     Ok(())
 }
@@ -391,12 +456,16 @@ fn profile_exposes_path(profile: &FilesystemProfile, path: &Path) -> bool {
     let Ok(path) = fs::canonicalize(path) else {
         return false;
     };
-    profile.mounts.iter().any(|mount| {
-        let FilesystemMount::Bind { source, .. } = mount else {
-            return false;
-        };
-        fs::canonicalize(source).is_ok_and(|source| path.starts_with(source))
-    })
+    profile
+        .runtime_paths
+        .iter()
+        .any(|runtime_path| path.starts_with(&runtime_path.source))
+        || profile.mounts.iter().any(|mount| {
+            let FilesystemMount::Bind { source, .. } = mount else {
+                return false;
+            };
+            fs::canonicalize(source).is_ok_and(|source| path.starts_with(source))
+        })
 }
 
 fn trusted_library_path(path: &Path, trusted_dirs: &[PathBuf]) -> bool {
@@ -518,6 +587,7 @@ mod tests {
         let profile = FilesystemProfile {
             name: "minimal".to_string(),
             mounts: Vec::new(),
+            runtime_paths: Vec::new(),
         };
         let runtime = runtime_files(Path::new("/usr/bin/true"), Path::new("/bin/sh"), &profile)
             .expect("system commands have inspectable runtimes");
@@ -536,6 +606,53 @@ mod tests {
                 .iter()
                 .any(|file| file.target.to_string_lossy().contains("libc.so"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_symlink_runtime_path_does_not_expose_its_canonical_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("runtime path root");
+        let alias = root.path().join("selected-true");
+        let source = fs::canonicalize("/usr/bin/true").expect("true source");
+        symlink(&source, &alias).expect("create selected symlink");
+        let profile = FilesystemProfile {
+            name: "selected-runtime".to_string(),
+            mounts: Vec::new(),
+            runtime_paths: vec![crate::filesystem::RuntimePath {
+                source: source.clone(),
+                target: alias.clone(),
+            }],
+        };
+
+        let runtime = runtime_files(Path::new("/usr/bin/false"), Path::new("/bin/sh"), &profile)
+            .expect("selected runtime path is inspectable");
+        assert!(runtime.iter().any(|file| file.target == alias));
+        assert!(
+            !runtime.iter().any(|file| file.target == source),
+            "the selected symlink source must not be exposed at an unselected path"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_opaque_runtime_file_is_mounted_without_dependency_scanning() {
+        let root = tempfile::tempdir().expect("runtime path root");
+        let data = root.path().join("package.json");
+        fs::write(&data, "{\"type\":\"module\"}").expect("write data file");
+        let profile = FilesystemProfile {
+            name: "selected-runtime".to_string(),
+            mounts: Vec::new(),
+            runtime_paths: vec![crate::filesystem::RuntimePath {
+                source: data.clone(),
+                target: data.clone(),
+            }],
+        };
+
+        let runtime = runtime_files(Path::new("/usr/bin/true"), Path::new("/bin/sh"), &profile)
+            .expect("opaque runtime data is allowed");
+        assert!(runtime.iter().any(|file| file.target == data));
     }
 
     #[test]
