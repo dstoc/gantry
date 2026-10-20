@@ -209,6 +209,12 @@ pub(crate) async fn start_command_process_with_baffle_config(
         Ok(execution) => Ok(execution),
         Err(StartError::Spawn(source)) => Err(ToolError::Spawn { source }),
         Err(StartError::Setup(details)) => Err(ToolError::BackendSetup { details }),
+        Err(StartError::StartupTimeout { timeout }) => Err(ToolError::BackendSetup {
+            details: format!(
+                "Bubblewrap supervisor startup timed out after {} seconds",
+                timeout.as_secs()
+            ),
+        }),
     }
 }
 

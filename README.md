@@ -41,6 +41,7 @@ Server options and their environment variables:
 - `--bind-uds ABSOLUTE_PATH` or `GANTRY_BIND_UDS`: Unix socket listener
 - `--policy-dir PATH` or `GANTRY_POLICY_DIR`: directory containing `.rego` policy files
 - `--backend bubblewrap|direct`: select the server's execution backend
+- `GANTRY_BUBBLEWRAP_STARTUP_TIMEOUT_SECS`: positive integer number of seconds for Bubblewrap startup. The default is `30`. The deadline starts when Bubblewrap spawns and ends when the supervisor sends its `started` status. Gantry rejects zero and non-integer values. This setting does not limit command runtime.
 
 Command-line values take precedence over environment values. A listener flag selects that listener and ignores both listener environment variables. Without a listener flag, set at most one listener environment variable. If neither is set, Gantry uses TCP on `127.0.0.1:8000`. `--bind-addr` and `--bind-uds` cannot both be supplied.
 
