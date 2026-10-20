@@ -9,6 +9,7 @@ mod linux {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+    use std::time::Duration;
 
     use base64::Engine as _;
     use tokio::io::{
@@ -16,6 +17,7 @@ mod linux {
     };
     use tokio::process::Command;
     use tokio::sync::oneshot;
+    use tokio::time::{Instant, timeout_at};
 
     use crate::backend::{StartError, runtime::runtime_files};
     use crate::baffle::{
@@ -29,6 +31,8 @@ mod linux {
 
     const SUPERVISOR_TARGET: &str = "/run/gantry-supervisor";
     const FIRST_MOUNT_FD: RawFd = 4;
+    const STARTUP_TIMEOUT_ENV: &str = "GANTRY_BUBBLEWRAP_STARTUP_TIMEOUT_SECS";
+    const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Debug, serde::Serialize)]
     struct InvocationMessage<'a> {
@@ -72,6 +76,12 @@ mod linux {
         plan: ExecutionPlan,
         baffle: BaffleRuntimeConfig,
     ) -> Result<RunningExecution, StartError> {
+        let startup_timeout = startup_timeout_from_env().map_err(StartError::Setup)?;
+        if Instant::now().checked_add(startup_timeout).is_none() {
+            return Err(StartError::Setup(format!(
+                "{STARTUP_TIMEOUT_ENV} exceeds the supported timeout range"
+            )));
+        }
         let diagnostics = ExecutionDiagnostics::from_plan(&plan);
         plan.validate_compatibility().map_err(StartError::Setup)?;
         let supervisor = find_supervisor().map_err(StartError::Setup)?;
@@ -203,6 +213,15 @@ mod linux {
         let mut command = Command::new(&bubblewrap);
         let use_baffle_proxy = baffle_lease.is_some();
         build_bubblewrap_args(&mut command, &mounts, profile);
+        let message = InvocationMessage {
+            executable: &plan.invocation.executable,
+            args: &plan.invocation.args,
+            cwd: &plan.invocation.cwd,
+            environment: &plan.invocation.environment,
+            proxy_socket: use_baffle_proxy.then_some(Path::new(SANDBOX_SOCKET)),
+        };
+        let message =
+            serde_json::to_vec(&message).map_err(|error| StartError::Setup(error.to_string()))?;
         command
             .arg("--")
             .arg(SUPERVISOR_TARGET)
@@ -237,85 +256,17 @@ mod linux {
         })?;
         let mut execution =
             RunningExecution::new_starting(child, true, baffle_lease.take(), diagnostics);
+        let Some(startup_deadline) = Instant::now().checked_add(startup_timeout) else {
+            execution.cancel().await;
+            return Err(StartError::Setup(format!(
+                "{STARTUP_TIMEOUT_ENV} exceeds the supported timeout range"
+            )));
+        };
         drop(inherited_mount_fds);
         drop(mounts);
-
-        let stdin_result = async {
-            let mut stdin = execution
-                .child_mut()
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("Bubblewrap launcher stdin pipe is missing"))?;
-            let message = InvocationMessage {
-                executable: &plan.invocation.executable,
-                args: &plan.invocation.args,
-                cwd: &plan.invocation.cwd,
-                environment: &plan.invocation.environment,
-                proxy_socket: use_baffle_proxy.then_some(Path::new(SANDBOX_SOCKET)),
-            };
-            let bytes = serde_json::to_vec(&message)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            stdin.write_all(&bytes).await?;
-            stdin.shutdown().await
-        }
-        .await;
-        if let Err(error) = stdin_result {
-            terminate_launcher(execution.child_mut()).await;
-            return Err(StartError::Setup(format!(
-                "failed to send the authorized invocation to the Bubblewrap supervisor: {error}"
-            )));
-        }
-
-        let stdout = match execution.child_mut().stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_launcher(execution.child_mut()).await;
-                return Err(StartError::Setup(
-                    "Bubblewrap supervisor stdout pipe is missing".to_string(),
-                ));
-            }
-        };
-        let mut status_reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let read_result = status_reader.read_line(&mut line).await;
-        let status = match read_result {
-            Ok(0) => {
-                let diagnostics = launcher_diagnostics(execution.child_mut()).await;
-                return Err(StartError::Setup(format!(
-                    "Bubblewrap exited before the authorized command started{diagnostics}"
-                )));
-            }
-            Ok(_) => match serde_json::from_str::<SupervisorMessage>(&line) {
-                Ok(status) => status,
-                Err(error) => {
-                    terminate_launcher(execution.child_mut()).await;
-                    return Err(StartError::Setup(format!(
-                        "Bubblewrap supervisor returned an invalid startup status: {error}"
-                    )));
-                }
-            },
-            Err(error) => {
-                terminate_launcher(execution.child_mut()).await;
-                return Err(StartError::Setup(format!(
-                    "failed to read Bubblewrap supervisor startup status: {error}"
-                )));
-            }
-        };
-        match status {
-            SupervisorMessage::Started => {}
-            SupervisorMessage::SetupError { error } => {
-                terminate_launcher(execution.child_mut()).await;
-                return Err(StartError::Setup(format!(
-                    "Bubblewrap command startup failed: {error}"
-                )));
-            }
-            _ => {
-                terminate_launcher(execution.child_mut()).await;
-                return Err(StartError::Setup(
-                    "Bubblewrap supervisor returned an unexpected startup status".to_string(),
-                ));
-            }
-        }
+        let status_reader =
+            await_supervisor_startup(&mut execution, &message, startup_deadline, startup_timeout)
+                .await?;
         drop(baffle_trust_material);
 
         let baffle_session_id = execution.baffle_session_id().map(str::to_owned);
@@ -336,12 +287,112 @@ mod linux {
         });
         let stdout: crate::execution::OutputReader = Box::new(stdout_reader);
         let stderr = execution
-            .child_mut()
-            .stderr
-            .take()
+            .take_startup_stderr()
             .map(|reader| Box::new(reader) as crate::execution::OutputReader);
         execution.set_streams(Some(stdout), stderr, final_status_rx);
         Ok(execution)
+    }
+
+    fn startup_timeout_from_env() -> Result<Duration, String> {
+        startup_timeout_from_value(std::env::var_os(STARTUP_TIMEOUT_ENV))
+    }
+
+    fn startup_timeout_from_value(value: Option<std::ffi::OsString>) -> Result<Duration, String> {
+        let Some(value) = value else {
+            return Ok(DEFAULT_STARTUP_TIMEOUT);
+        };
+        let seconds = value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| {
+                format!("{STARTUP_TIMEOUT_ENV} must be a positive integer number of seconds")
+            })?;
+        Ok(Duration::from_secs(seconds))
+    }
+
+    async fn await_supervisor_startup(
+        execution: &mut RunningExecution,
+        message: &[u8],
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<BufReader<tokio::process::ChildStdout>, StartError> {
+        let stdin_result = timeout_at(deadline, async {
+            let mut stdin = execution
+                .take_startup_stdin()
+                .ok_or_else(|| io::Error::other("Bubblewrap launcher stdin pipe is missing"))?;
+            stdin.write_all(message).await?;
+            stdin.shutdown().await
+        })
+        .await;
+        match stdin_result {
+            Err(_) => {
+                execution.cancel().await;
+                return Err(StartError::StartupTimeout { timeout });
+            }
+            Ok(Err(error)) => {
+                execution.cancel().await;
+                return Err(StartError::Setup(format!(
+                    "failed to send the authorized invocation to the Bubblewrap supervisor: {error}"
+                )));
+            }
+            Ok(Ok(())) => {}
+        }
+
+        let stdout = match execution.take_startup_stdout() {
+            Some(stdout) => stdout,
+            None => {
+                execution.cancel().await;
+                return Err(StartError::Setup(
+                    "Bubblewrap supervisor stdout pipe is missing".to_string(),
+                ));
+            }
+        };
+        let mut status_reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let read_result = timeout_at(deadline, status_reader.read_line(&mut line)).await;
+        let status = match read_result {
+            Err(_) => {
+                execution.cancel().await;
+                return Err(StartError::StartupTimeout { timeout });
+            }
+            Ok(Ok(0)) => {
+                let diagnostics = launcher_diagnostics(execution).await;
+                return Err(StartError::Setup(format!(
+                    "Bubblewrap exited before the authorized command started{diagnostics}"
+                )));
+            }
+            Ok(Ok(_)) => match serde_json::from_str::<SupervisorMessage>(&line) {
+                Ok(status) => status,
+                Err(error) => {
+                    execution.cancel().await;
+                    return Err(StartError::Setup(format!(
+                        "Bubblewrap supervisor returned an invalid startup status: {error}"
+                    )));
+                }
+            },
+            Ok(Err(error)) => {
+                execution.cancel().await;
+                return Err(StartError::Setup(format!(
+                    "failed to read Bubblewrap supervisor startup status: {error}"
+                )));
+            }
+        };
+        match status {
+            SupervisorMessage::Started => Ok(status_reader),
+            SupervisorMessage::SetupError { error } => {
+                execution.cancel().await;
+                Err(StartError::Setup(format!(
+                    "Bubblewrap command startup failed: {error}"
+                )))
+            }
+            _ => {
+                execution.cancel().await;
+                Err(StartError::Setup(
+                    "Bubblewrap supervisor returned an unexpected startup status".to_string(),
+                ))
+            }
+        }
     }
 
     async fn forward_supervisor_output<R, W>(
@@ -693,37 +744,31 @@ mod linux {
         Ok(())
     }
 
-    async fn terminate_launcher(child: &mut tokio::process::Child) {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
-
-    async fn launcher_diagnostics(child: &mut tokio::process::Child) -> String {
-        if let Some(mut stderr) = child.stderr.take() {
-            let mut message = String::new();
-            let _ = stderr.read_to_string(&mut message).await;
-            let _ = child.wait().await;
-            if message.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", message.trim())
-            }
+    async fn launcher_diagnostics(execution: &mut RunningExecution) -> String {
+        let mut message = String::new();
+        if let Some(mut stderr) = execution.take_startup_stderr() {
+            let (read_result, _) =
+                tokio::join!(stderr.read_to_string(&mut message), execution.cancel());
+            let _ = read_result;
         } else {
-            let _ = child.wait().await;
+            execution.cancel().await;
+        }
+        if message.trim().is_empty() {
             String::new()
+        } else {
+            format!(": {}", message.trim())
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::baffle::{BaffleRuntimeConfig, create_ephemeral_session};
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::net::UnixListener;
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener as TokioUnixListener;
 
         #[test]
         fn pinned_data_socket_remains_the_original_socket_after_path_replacement() {
@@ -749,6 +794,202 @@ mod linux {
             );
             assert!(descriptor_is_socket(descriptor.as_raw_fd()).expect("pinned socket type"));
             drop(replacement_listener);
+        }
+
+        #[test]
+        fn startup_timeout_configuration_has_a_documented_default_and_requires_positive_seconds() {
+            assert_eq!(
+                startup_timeout_from_value(None).expect("default startup timeout"),
+                Duration::from_secs(30)
+            );
+            assert_eq!(
+                startup_timeout_from_value(Some("7".into())).expect("configured timeout"),
+                Duration::from_secs(7)
+            );
+            for invalid in ["", "0", "-1", "1.5", "many"] {
+                assert!(
+                    startup_timeout_from_value(Some(invalid.into())).is_err(),
+                    "invalid timeout should be rejected: {invalid:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn stalled_supervisor_timeout_reaps_process_group_before_releasing_session() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let started = directory.path().join("descendant-started");
+            let marker = directory.path().join("descendant-survived");
+            let control_path = directory.path().join("control.sock");
+            let session_path = directory.path().join("assigned.sock");
+            let control_listener =
+                TokioUnixListener::bind(&control_path).expect("Baffle control listener");
+            let _session_listener =
+                TokioUnixListener::bind(&session_path).expect("Baffle session socket");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "(touch \"$STARTED_MARKER\"; sleep 0.5; touch \"$LATE_MARKER\") & wait",
+                ])
+                .env("STARTED_MARKER", &started)
+                .env("LATE_MARKER", &marker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            let child = command.spawn().expect("stalled supervisor process");
+            let pid = child.id().expect("launcher PID");
+            let response_socket = session_path.clone();
+            let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test CA certificate")
+                .cert
+                .pem();
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+            let daemon = tokio::spawn(async move {
+                let (mut stream, _) = control_listener
+                    .accept()
+                    .await
+                    .expect("Baffle client connects");
+                let mut header = [0; 4];
+                stream
+                    .read_exact(&mut header)
+                    .await
+                    .expect("read create request length");
+                let mut request = vec![0; u32::from_be_bytes(header) as usize];
+                stream
+                    .read_exact(&mut request)
+                    .await
+                    .expect("read create request");
+                let response = serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "ok": true,
+                    "result": {
+                        "id": "startup-timeout-session",
+                        "socket": response_socket,
+                        "persistent": false,
+                        "ca_certificate_pem": certificate
+                    }
+                }))
+                .expect("response JSON");
+                stream
+                    .write_all(&(response.len() as u32).to_be_bytes())
+                    .await
+                    .expect("write response length");
+                stream.write_all(&response).await.expect("write response");
+
+                let mut byte = [0; 1];
+                assert_eq!(
+                    stream.read(&mut byte).await.expect("read lease closure"),
+                    0,
+                    "timeout must release the Baffle lease"
+                );
+                let launcher_alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+                closed_tx
+                    .send(launcher_alive)
+                    .expect("report lease close ordering");
+            });
+            let lease = create_ephemeral_session(
+                &BaffleRuntimeConfig {
+                    control_socket: control_path,
+                },
+                "startup-timeout.toml",
+            )
+            .await
+            .expect("create mock Baffle session");
+            let mut execution = RunningExecution::new_starting(
+                child,
+                true,
+                Some(lease),
+                ExecutionDiagnostics {
+                    backend: crate::execution::ExecutionBackend::Bubblewrap,
+                    filesystem_profile: None,
+                    baffle_filename: None,
+                    baffle_session_id: None,
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("supervisor descendant started");
+
+            let timeout = Duration::from_millis(50);
+            let error = match await_supervisor_startup(
+                &mut execution,
+                br#"{"executable":"/usr/bin/true"}"#,
+                Instant::now() + timeout,
+                timeout,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("stalled supervisor must time out"),
+            };
+            match error {
+                StartError::StartupTimeout { timeout: actual } => assert_eq!(actual, timeout),
+                StartError::Setup(details) => panic!("unexpected startup failure: {details}"),
+                StartError::Spawn(error) => panic!("unexpected spawn failure: {error}"),
+            }
+            let launcher_alive_when_session_closed =
+                tokio::time::timeout(Duration::from_secs(3), closed_rx)
+                    .await
+                    .expect("mock daemon observed lease close")
+                    .expect("report launcher state");
+            assert!(
+                !launcher_alive_when_session_closed,
+                "launcher must be reaped before the Baffle lease closes"
+            );
+            let launcher_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            assert_eq!(
+                launcher_result, -1,
+                "launcher must be reaped before startup failure is returned"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "the launcher PID must no longer be present"
+            );
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(!marker.exists(), "timeout left a descendant running");
+            daemon.await.expect("mock Baffle daemon task");
+        }
+
+        #[tokio::test]
+        async fn ready_supervisor_succeeds_before_the_startup_deadline() {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "printf '%s\\n' '{\"status\":\"started\"}'; sleep 30"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            let child = command.spawn().expect("ready supervisor process");
+            let mut execution = RunningExecution::new_starting(
+                child,
+                true,
+                None,
+                ExecutionDiagnostics {
+                    backend: crate::execution::ExecutionBackend::Bubblewrap,
+                    filesystem_profile: None,
+                    baffle_filename: None,
+                    baffle_session_id: None,
+                },
+            );
+            let timeout = Duration::from_secs(1);
+            let status_reader = await_supervisor_startup(
+                &mut execution,
+                br#"{"executable":"/usr/bin/true"}"#,
+                Instant::now() + timeout,
+                timeout,
+            )
+            .await
+            .expect("ready supervisor starts");
+            drop(status_reader);
+            execution.cancel().await;
         }
     }
 }
