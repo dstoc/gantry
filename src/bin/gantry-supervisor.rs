@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -140,6 +140,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     command.env_clear();
     command.envs(invocation.environment);
 
+    enable_child_subreaper()?;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -185,8 +186,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
     });
 
+    if let Err(error) = wait_for_exit_without_reaping(pid).await {
+        terminate_sandbox_descendants();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = reap_sandbox_descendants();
+        return Err(error.into());
+    }
+    terminate_sandbox_descendants();
     let status = child.wait().await?;
-    terminate_sandbox_descendants(pid);
+    reap_sandbox_descendants()?;
     if let Some(bridge) = bridge.take() {
         bridge.stop().await;
     }
@@ -264,12 +273,62 @@ async fn write_message<W: AsyncWrite + Unpin>(
     output.flush().await
 }
 
-fn terminate_sandbox_descendants(command_pid: i32) {
+async fn wait_for_exit_without_reaping(pid: i32) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn terminate_sandbox_descendants() {
     unsafe {
-        libc::kill(-command_pid, libc::SIGKILL);
+        // The PID namespace contains only this sandbox. Avoid a group signal
+        // that could use a command PID after it has been reaped.
         libc::kill(-1, libc::SIGKILL);
+    }
+}
+
+fn enable_child_subreaper() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn reap_sandbox_descendants() -> io::Result<()> {
+    loop {
         let mut status = 0;
-        while libc::waitpid(-1, &mut status, 0) > 0 {}
+        let result = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if result > 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(());
+        }
+        return Err(error);
     }
 }
 

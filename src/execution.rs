@@ -171,6 +171,32 @@ impl ExecutionExitStatus {
 
 type FinalStatusReceiver = oneshot::Receiver<Result<ExecutionExitStatus, io::Error>>;
 
+#[cfg(unix)]
+async fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 impl RunningExecution {
     pub(crate) fn new(
         mut child: Child,
@@ -248,8 +274,21 @@ impl RunningExecution {
         if let Some(status) = self.completed_status {
             return Ok(status);
         }
+        #[cfg(unix)]
+        if self.process_group.is_some() {
+            if let Some(pid) = self.child.id() {
+                if let Err(error) = wait_for_exit_without_reaping(pid).await {
+                    self.terminate_descendants();
+                    let _ = self.child.start_kill();
+                    let _ = self.child.wait().await;
+                    return Err(error);
+                }
+                self.terminate_descendants();
+            } else {
+                self.process_group = None;
+            }
+        }
         let status = self.child.wait().await?;
-        self.terminate_descendants();
         let status = if let Some(receiver) = self.final_status.as_mut() {
             let status = (&mut *receiver).await.map_err(|_| {
                 io::Error::new(
@@ -300,9 +339,9 @@ impl RunningExecution {
         );
     }
 
-    fn terminate_descendants(&self) {
+    fn terminate_descendants(&mut self) {
         #[cfg(unix)]
-        if let Some(process_group) = self.process_group {
+        if let Some(process_group) = self.process_group.take() {
             unsafe {
                 libc::kill(-(process_group as libc::pid_t), libc::SIGKILL);
             }
@@ -373,6 +412,38 @@ impl Drop for RunningExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn test_diagnostics() -> ExecutionDiagnostics {
+        ExecutionDiagnostics {
+            backend: ExecutionBackend::Direct,
+            filesystem_profile: None,
+            baffle_filename: None,
+            baffle_session_id: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_process_group(
+        script: &str,
+        started: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> Child {
+        use std::process::Stdio;
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .env("STARTED_MARKER", started)
+            .env("LATE_MARKER", marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        command.spawn().expect("test process group starts")
+    }
 
     #[cfg(unix)]
     struct ReadObserved<R> {
@@ -542,6 +613,89 @@ mod tests {
             "launcher must be reaped before the Baffle lease closes"
         );
         daemon.await.expect("mock daemon task");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_kills_remaining_group_members_before_reaping_and_preserves_exit_status() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let started = directory.path().join("descendant-started");
+        let marker = directory.path().join("descendant-survived");
+        let child = spawn_test_process_group(
+            "(touch \"$STARTED_MARKER\"; sleep 0.5; touch \"$LATE_MARKER\") & while [ ! -e \"$STARTED_MARKER\" ]; do sleep 0.01; done; exit 23",
+            &started,
+            &marker,
+        );
+        let mut execution = RunningExecution::new(child, true, test_diagnostics());
+
+        let status = execution.wait().await.expect("execution waits");
+        assert_eq!(status.code(), Some(23));
+        assert!(
+            started.exists(),
+            "the descendant started before its parent exited"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!marker.exists(), "wait left a descendant running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_remaining_group_members() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let started = directory.path().join("descendant-started");
+        let marker = directory.path().join("descendant-survived");
+        let child = spawn_test_process_group(
+            "(touch \"$STARTED_MARKER\"; sleep 0.5; touch \"$LATE_MARKER\") & while [ ! -e \"$STARTED_MARKER\" ]; do sleep 0.01; done; wait",
+            &started,
+            &marker,
+        );
+        let mut execution = RunningExecution::new(child, true, test_diagnostics());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant started");
+
+        execution.cancel().await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!marker.exists(), "cancellation left a descendant running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_error_still_cleans_up_remaining_group_members() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let started = directory.path().join("descendant-started");
+        let marker = directory.path().join("descendant-survived");
+        let child = spawn_test_process_group(
+            "(touch \"$STARTED_MARKER\"; sleep 0.5; touch \"$LATE_MARKER\") & while [ ! -e \"$STARTED_MARKER\" ]; do sleep 0.01; done; exit 23",
+            &started,
+            &marker,
+        );
+        let mut execution = RunningExecution::new(child, true, test_diagnostics());
+        let (sender, receiver) = oneshot::channel();
+        drop(sender);
+        execution.set_streams(None, None, receiver);
+
+        let error = execution
+            .wait()
+            .await
+            .expect_err("missing final status is an error");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            started.exists(),
+            "the descendant started before its parent exited"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!marker.exists(), "error cleanup left a descendant running");
     }
 
     #[test]
