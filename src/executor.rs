@@ -1928,7 +1928,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             missing_helper.stderr
         );
 
-        let runtime_paths = vec![python.clone(), python_stdlib.clone()];
+        let mut runtime_paths = vec![python.clone(), python_stdlib.clone()];
         write_profile(&runtime_paths);
         let engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
 
@@ -1965,8 +1965,11 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         assert_eq!(direct_python.exit_code, Some(0), "{}", direct_python.stderr);
 
         let node = tools.iter().find(|(name, _)| *name == "node").unwrap();
-        let node_builtin = PathBuf::from("/usr/share/nodejs/cjs-module-lexer/lexer.js");
-        if node_builtin.is_file() {
+        // Debian's Node package externalizes this builtin in a package directory,
+        // but the file layout differs between Debian releases (for example,
+        // `lexer.js` versus `dist/lexer.js`). Select only that package directory.
+        let node_builtin_dir = PathBuf::from("/usr/share/nodejs/cjs-module-lexer");
+        if node_builtin_dir.is_dir() {
             let node_without_builtin = run_command_with_backend(
                 &engine,
                 &cwd,
@@ -1983,19 +1986,19 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             )
             .await
             .expect("Node without its selected builtin is a command failure");
-            if node_without_builtin.exit_code != Some(0) {
-                assert!(
-                    node_without_builtin
-                        .stderr
-                        .contains("/usr/share/nodejs/cjs-module-lexer/lexer.js"),
-                    "missing Node builtin should be identified clearly: {node_without_builtin:?}"
-                );
-            }
-            write_profile(&[
-                python.clone(),
-                python_stdlib.clone(),
-                node_builtin.to_string_lossy().into_owned(),
-            ]);
+            assert_ne!(
+                node_without_builtin.exit_code,
+                Some(0),
+                "Node unexpectedly ran without its externalized builtin"
+            );
+            assert!(
+                node_without_builtin
+                    .stderr
+                    .contains("/usr/share/nodejs/cjs-module-lexer/"),
+                "missing Node builtin should be identified clearly: {node_without_builtin:?}"
+            );
+            runtime_paths.push(node_builtin_dir.to_string_lossy().into_owned());
+            write_profile(&runtime_paths);
         }
         let engine = PolicyEngine::from_sources(Some(policy_dir));
         let node_output = run_command_with_backend(
