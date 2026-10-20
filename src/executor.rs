@@ -1374,30 +1374,34 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         .expect("Direct exit 128 execution");
         assert_eq!(output.exit_code, Some(128));
 
-        if !bubblewrap_capable() {
-            return;
-        }
-        let root = tempfile::tempdir().expect("Bubblewrap policy root");
-        let bubblewrap_engine = policy_engine_with_selection(root.path(), Some("minimal"), None);
-        let output = run_command_with_backend(
-            &bubblewrap_engine,
-            &cwd,
-            ExecutionBackend::Bubblewrap,
-            invoke("kill -TERM $$"),
-        )
-        .await
-        .expect("Bubblewrap signal execution");
-        assert_eq!(output.exit_code, None);
+        #[cfg(target_os = "linux")]
+        {
+            if !bubblewrap_capable() {
+                return;
+            }
+            let root = tempfile::tempdir().expect("Bubblewrap policy root");
+            let bubblewrap_engine =
+                policy_engine_with_selection(root.path(), Some("minimal"), None);
+            let output = run_command_with_backend(
+                &bubblewrap_engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                invoke("kill -TERM $$"),
+            )
+            .await
+            .expect("Bubblewrap signal execution");
+            assert_eq!(output.exit_code, None);
 
-        let output = run_command_with_backend(
-            &bubblewrap_engine,
-            &cwd,
-            ExecutionBackend::Bubblewrap,
-            invoke("exit 128"),
-        )
-        .await
-        .expect("Bubblewrap exit 128 execution");
-        assert_eq!(output.exit_code, Some(128));
+            let output = run_command_with_backend(
+                &bubblewrap_engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                invoke("exit 128"),
+            )
+            .await
+            .expect("Bubblewrap exit 128 execution");
+            assert_eq!(output.exit_code, Some(128));
+        }
     }
 
     #[cfg(target_os = "linux")]
