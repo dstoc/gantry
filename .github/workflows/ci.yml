@@ -35,7 +35,7 @@ jobs:
             docker.io/library/rust:1-bookworm \
             sh -euc '
               apt-get update
-              apt-get install --yes bubblewrap curl gcc cmake clang libclang-dev pkg-config git
+              apt-get install --yes bubblewrap curl gcc cmake clang libclang-dev pkg-config git python3 nodejs gh
               git clone --no-checkout https://github.com/dstoc/baffle.git /tmp/baffle
               git -C /tmp/baffle checkout v2.0.0
               cd /tmp/baffle

@@ -47,7 +47,7 @@ Command-line values take precedence over environment values. A listener flag sel
 
 The old server variables `MCP_BIND_ADDR`, `MCP_BIND_UDS`, and `POLICY_DIR` are ignored. The `run-remote` client variables `RUN_REMOTE_SERVER` and `RUN_REMOTE_SOCKET` are unchanged.
 
-Bubblewrap is the default backend. It requires Linux, Bubblewrap with descriptor-based bind support, and the `gantry-supervisor` binary installed beside `gantry`. Each command receives a separate user, mount, PID, and network namespace. A restricted runtime view exposes the authorized executable, its interpreter and shared libraries, private `/proc`, `/tmp`, and `/run`, and only the selected profile mounts. Bubblewrap setup errors fail closed. Use `--backend direct` to explicitly select unsandboxed execution; Direct policies must return `filesystem: null` and `baffle_session: null`.
+Bubblewrap is the default backend. It requires Linux, Bubblewrap with descriptor-based bind support, and the `gantry-supervisor` binary installed beside `gantry`. Each command receives a separate user, mount, PID, and network namespace. A restricted runtime view exposes the authorized executable, its automatically discovered interpreter and ELF shared libraries, the extra paths selected by the filesystem profile, private `/proc`, `/tmp`, and `/run`, and only the selected profile mounts. Bubblewrap setup errors fail closed. Use `--backend direct` to explicitly select unsandboxed execution; Direct policies must return `filesystem: null` and `baffle_session: null`.
 
 For a Bubblewrap decision with a non-null `baffle_session`, Gantry calls Baffle's file-only `create_ephemeral_from_file` API and holds the lease until the supervisor and bridge stop. Baffle 2.0.0 or later is required. Configure the control socket with this trusted server environment variable when it differs from Baffle's platform default:
 
@@ -185,6 +185,22 @@ size = "256MiB"
 ```
 
 Bind access must be `read-only` or `read-write`. Tmpfs sizes must be positive and use `B`, `KiB`, `MiB`, or `GiB`. Profiles are administrator-controlled; Rego selects a profile name and cannot choose mount paths or access.
+
+## Runtime Dependencies
+
+Bubblewrap automatically exposes the authorized executable and supervisor, each ELF `PT_INTERP` interpreter, recursively required `DT_NEEDED` libraries, and direct script shebang interpreters. It reads ELF metadata without running the authorized command on the host. It does not search `PATH` for commands named by `/usr/bin/env`, inspect commands a workload starts later, or discover `dlopen` libraries and plugins. RPATH or RUNPATH libraries are used only when a selected filesystem profile exposes their source.
+
+Administrators can add exact paths to a filesystem profile with the optional `runtime_paths` array:
+
+```toml
+version = 1
+runtime_paths = ["/usr/bin/python3", "/usr/lib/python3.13"]
+mounts = []
+```
+
+Each entry must resolve to a regular file or directory. Gantry mounts it read-only at its listed absolute path and resolves configured symlinks when it pins the source. It inspects selected files for ELF and direct shebang dependencies. Other files are mounted as opaque content. A selected directory is mounted as-is; Gantry does not scan its contents for plugins, helpers, or dynamically loaded libraries. Add each helper executable, library, plugin, or required data directory that the workload needs. Directory entries expose every item beneath that directory, so use the narrowest paths that support the workload. Runtime paths cannot overlap another runtime path, a filesystem mount destination, or the private `/dev`, `/proc`, `/run`, and `/sys` trees. Runtime paths are part of the selected administrator profile and are not available to policies or command callers as arbitrary path input.
+
+For `#!/usr/bin/env python3`, Gantry discovers `/usr/bin/env` as the script interpreter. The profile must also expose the `python3` executable at a location in the command `PATH`, plus any required standard-library or module directories. The exact paths depend on the installed distribution. If the profile omits `python3`, `env` exits with an error; Gantry does not widen the runtime or switch to Direct. The same rule applies to helpers used by Python, Node, Git, `gh`, and Cargo. When one of these tools is the authorized command, Gantry adds that executable and its ELF dependencies automatically. Other tools and plugin paths must be selected in `runtime_paths`.
 
 ### Migrating from the Boolean Contract
 

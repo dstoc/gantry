@@ -135,6 +135,23 @@ mod linux {
             }
         }
 
+        for runtime_path in &profile.runtime_paths {
+            let descriptor = open_pinned(&runtime_path.source, true).map_err(|error| {
+                StartError::Setup(format!(
+                    "failed to pin selected runtime path '{}': {error}",
+                    runtime_path.target.display()
+                ))
+            })?;
+            let is_directory = descriptor_is_directory(descriptor.as_raw_fd())
+                .map_err(|error| StartError::Setup(error.to_string()))?;
+            mounts.push(PinnedMount {
+                target: runtime_path.target.clone(),
+                kind: MountSourceKind::ReadOnly,
+                descriptor,
+                is_directory,
+            });
+        }
+
         for file in runtime {
             if runtime_file_is_supplied_by_profile(profile, &file.source, &file.target)? {
                 continue;
@@ -568,6 +585,17 @@ mod linux {
         source: &Path,
         target: &Path,
     ) -> Result<bool, StartError> {
+        for runtime_path in &profile.runtime_paths {
+            if !target.starts_with(&runtime_path.target) {
+                continue;
+            }
+            let relative = target.strip_prefix(&runtime_path.target).map_err(|error| {
+                StartError::Setup(format!("invalid runtime path mapping: {error}"))
+            })?;
+            let supplied = runtime_path.source.join(relative);
+            return Ok(fs::canonicalize(&supplied).ok() == fs::canonicalize(source).ok());
+        }
+
         for mount in &profile.mounts {
             let FilesystemMount::Bind {
                 source: profile_source,

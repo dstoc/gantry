@@ -1400,7 +1400,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn bubblewrap_uses_custom_rpath_libraries_only_when_the_profile_mounts_them() {
+    async fn bubblewrap_uses_custom_rpath_libraries_only_when_the_profile_exposes_them() {
         if !bubblewrap_capable() {
             return;
         }
@@ -1423,12 +1423,11 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         std::fs::write(
             filesystem_dir.join("custom.toml"),
             format!(
-                "version = 1\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
-                custom_dir.to_string_lossy(),
-                custom_dir.to_string_lossy(),
+                "version = 1\nruntime_paths = [{:?}]\nmounts = []\n",
+                custom_dir.join("libreview.so").to_string_lossy(),
             ),
         )
-        .expect("write custom profile");
+        .expect("write profile with a selected library file");
         std::fs::write(
             filesystem_dir.join("minimal.toml"),
             "version = 1\nmounts = []\n",
@@ -1830,6 +1829,207 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             !cancelled_marker.exists(),
             "cancellation left a command descendant running"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_runs_profiled_interpreters_and_helper_workloads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !bubblewrap_capable() {
+            return;
+        }
+        let cwd = default_cwd_for_tests();
+        let root = tempfile::tempdir_in(&cwd).expect("runtime workload root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let script = workspace.join("env-python.py");
+        std::fs::write(&script, b"#!/usr/bin/env python3\nprint('python-env-ok')\n")
+            .expect("write Python env-shebang fixture");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("Python script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make Python script executable");
+
+        let python = find_executable("python3").expect("python3 installed for workload tests");
+        let stdlib_output = std::process::Command::new(&python)
+            .args([
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('stdlib'))",
+            ])
+            .output()
+            .expect("locate Python standard library");
+        assert!(
+            stdlib_output.status.success(),
+            "Python stdlib lookup failed"
+        );
+        let python_stdlib = String::from_utf8(stdlib_output.stdout)
+            .expect("Python stdlib path is UTF-8")
+            .trim()
+            .to_string();
+        let tools = ["node", "git", "gh", "cargo"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    find_executable(name)
+                        .unwrap_or_else(|| panic!("{name} installed for runtime workload tests")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let policy_dir = root.path().join("policies");
+        let filesystem_dir = root.path().join("filesystems");
+        std::fs::create_dir(&policy_dir).expect("policy directory");
+        std::fs::create_dir(&filesystem_dir).expect("filesystem directory");
+        std::fs::write(
+            policy_dir.join("main.rego"),
+            "package sandbox.main\n\ndecision := {\"allow\": true, \"filesystem\": \"workloads\", \"baffle_session\": null}\n",
+        )
+        .expect("write policy");
+        let profile_path = filesystem_dir.join("workloads.toml");
+        let write_profile = |runtime_paths: &[String]| {
+            let paths = runtime_paths
+                .iter()
+                .map(|path| format!("{path:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            std::fs::write(
+                &profile_path,
+                format!(
+                    "version = 1\nruntime_paths = [{paths}]\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
+                    workspace.to_string_lossy(),
+                    workspace.to_string_lossy(),
+                ),
+            )
+            .expect("write workload profile");
+        };
+
+        write_profile(&[]);
+        let missing_helper_engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+        let missing_helper = run_command_with_backend(
+            &missing_helper_engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: script.to_string_lossy().into_owned(),
+                args: vec![],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: None,
+            },
+        )
+        .await
+        .expect("missing env helper is a command failure, not a backend fallback");
+        assert_eq!(missing_helper.exit_code, Some(127));
+        assert!(
+            missing_helper.stderr.contains("python3"),
+            "missing helper error should identify python3: {}",
+            missing_helper.stderr
+        );
+
+        let runtime_paths = vec![python.clone(), python_stdlib];
+        write_profile(&runtime_paths);
+        let engine = PolicyEngine::from_sources(Some(policy_dir));
+
+        let env_python = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: script.to_string_lossy().into_owned(),
+                args: vec![],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: None,
+            },
+        )
+        .await
+        .expect("profiled env-shebang Python workload starts");
+        assert_eq!(env_python.stdout.trim(), "python-env-ok");
+        assert_eq!(env_python.exit_code, Some(0), "{}", env_python.stderr);
+
+        let direct_python = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: python,
+                args: vec!["-c".to_string(), "print('python-direct-ok')".to_string()],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: None,
+            },
+        )
+        .await
+        .expect("profiled Python workload starts");
+        assert_eq!(direct_python.stdout.trim(), "python-direct-ok");
+        assert_eq!(direct_python.exit_code, Some(0), "{}", direct_python.stderr);
+
+        let node = tools.iter().find(|(name, _)| *name == "node").unwrap();
+        let node_output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: node.1.clone(),
+                args: vec![
+                    "-e".to_string(),
+                    "process.stdout.write('node-ok')".to_string(),
+                ],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: None,
+            },
+        )
+        .await
+        .expect("profiled Node workload starts");
+        assert_eq!(node_output.stdout, "node-ok");
+        assert_eq!(node_output.exit_code, Some(0), "{}", node_output.stderr);
+
+        let git = tools.iter().find(|(name, _)| *name == "git").unwrap();
+        assert!(
+            std::process::Command::new(&git.1)
+                .args(["init", "--quiet"])
+                .current_dir(&workspace)
+                .status()
+                .expect("initialize Git fixture")
+                .success(),
+            "Git fixture initialization failed"
+        );
+        std::fs::write(workspace.join("fixture.txt"), "git workload\n")
+            .expect("write Git fixture file");
+        let git_output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: git.1.clone(),
+                args: vec!["status".to_string(), "--short".to_string()],
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: None,
+            },
+        )
+        .await
+        .expect("profiled Git workload starts");
+        assert!(git_output.stdout.contains("fixture.txt"), "{git_output:?}");
+        assert_eq!(git_output.exit_code, Some(0), "{}", git_output.stderr);
+
+        for (name, expected_prefix) in [("gh", "gh version"), ("cargo", "cargo ")] {
+            let executable = &tools.iter().find(|(tool, _)| *tool == name).unwrap().1;
+            let output = run_command_with_backend(
+                &engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                RunCommandInput {
+                    executable: executable.clone(),
+                    args: vec!["--version".to_string()],
+                    cwd: Some(workspace.to_string_lossy().into_owned()),
+                    env: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("profiled {name} workload failed to start: {error}"));
+            assert!(output.stdout.starts_with(expected_prefix), "{output:?}");
+            assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        }
     }
 
     #[cfg(unix)]
