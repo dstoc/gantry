@@ -1892,6 +1892,26 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         let root = tempfile::tempdir_in(&cwd).expect("runtime workload root");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
+        let cargo_project = workspace.join("cargo-fixture");
+        let cargo_source = cargo_project.join("src");
+        std::fs::create_dir_all(&cargo_source).expect("Cargo fixture source directory");
+        std::fs::write(
+            cargo_project.join("Cargo.toml"),
+            "[package]\nname = \"gantry-cargo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo fixture manifest");
+        std::fs::write(
+            cargo_project.join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"gantry-cargo-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo fixture lockfile");
+        std::fs::write(
+            cargo_source.join("main.rs"),
+            "fn main() { println!(\"cargo-workload-ok\"); }\n",
+        )
+        .expect("write Cargo fixture source");
+        let cargo_target = root.path().join("cargo-target");
+        std::fs::create_dir(&cargo_target).expect("Cargo fixture target directory");
         let script = workspace.join("env-python.py");
         std::fs::write(&script, b"#!/usr/bin/env python3\nprint('python-env-ok')\n")
             .expect("write Python env-shebang fixture");
@@ -1947,9 +1967,11 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             std::fs::write(
                 &profile_path,
                 format!(
-                    "version = 1\nruntime_paths = [{paths}]\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n",
+                    "version = 1\nruntime_paths = [{paths}]\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-only\"\n\n[[mounts]]\nsource = {:?}\ntarget = {:?}\naccess = \"read-write\"\n",
                     workspace.to_string_lossy(),
                     workspace.to_string_lossy(),
+                    cargo_target.to_string_lossy(),
+                    cargo_target.to_string_lossy(),
                 ),
             )
             .expect("write workload profile");
@@ -2073,7 +2095,62 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         }
         assert_eq!(node_output.stdout, "node-ok", "{node_output:?}");
         assert_eq!(node_output.exit_code, Some(0), "{}", node_output.stderr);
-        let engine = node_engine;
+        let mut engine = node_engine;
+
+        let rustc_path = find_executable("rustc").expect("rustc installed for Cargo workload");
+        let rustc_sysroot = std::process::Command::new(&rustc_path)
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("query Rust toolchain sysroot");
+        assert!(
+            rustc_sysroot.status.success(),
+            "Rust toolchain sysroot lookup failed: {}",
+            String::from_utf8_lossy(&rustc_sysroot.stderr)
+        );
+        let rustc_sysroot = PathBuf::from(
+            String::from_utf8(rustc_sysroot.stdout)
+                .expect("Rust toolchain sysroot path is UTF-8")
+                .trim(),
+        );
+        let rustup_home = rustc_sysroot
+            .parent()
+            .filter(|toolchains| {
+                toolchains
+                    .file_name()
+                    .is_some_and(|name| name == "toolchains")
+            })
+            .and_then(Path::parent);
+        let mut cargo_env = BTreeMap::from([(
+            "CARGO_TARGET_DIR".to_string(),
+            cargo_target.to_string_lossy().into_owned(),
+        )]);
+        let cargo_can_check = match rustup_home {
+            Some(rustup_home) if rustc_sysroot.is_dir() => {
+                let toolchain_name = rustc_sysroot
+                    .file_name()
+                    .expect("selected Rust toolchain has a directory name");
+                runtime_paths.push(rustc_sysroot.to_string_lossy().into_owned());
+                cargo_env.insert(
+                    "RUSTUP_HOME".to_string(),
+                    rustup_home.to_string_lossy().into_owned(),
+                );
+                cargo_env.insert(
+                    "RUSTUP_TOOLCHAIN".to_string(),
+                    toolchain_name.to_string_lossy().into_owned(),
+                );
+                cargo_env.insert(
+                    "RUSTC".to_string(),
+                    rustc_sysroot
+                        .join("bin/rustc")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                write_profile(&runtime_paths);
+                engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+                true
+            }
+            _ => false,
+        };
 
         let git = tools.iter().find(|(name, _)| *name == "git").unwrap();
         assert!(
@@ -2103,7 +2180,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         assert!(git_output.stdout.contains("fixture.txt"), "{git_output:?}");
         assert_eq!(git_output.exit_code, Some(0), "{}", git_output.stderr);
 
-        for (name, expected_prefix) in [("gh", "gh version"), ("cargo", "cargo ")] {
+        for (name, expected_prefix) in [("gh", "gh version")] {
             let executable = &tools.iter().find(|(tool, _)| *tool == name).unwrap().1;
             let output = run_command_with_backend(
                 &engine,
@@ -2120,6 +2197,47 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
             .unwrap_or_else(|error| panic!("profiled {name} workload failed to start: {error}"));
             assert!(output.stdout.starts_with(expected_prefix), "{output:?}");
             assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+        }
+
+        let cargo = &tools.iter().find(|(tool, _)| *tool == "cargo").unwrap().1;
+        let cargo_args = if cargo_can_check {
+            vec![
+                "check".to_string(),
+                "--offline".to_string(),
+                "--locked".to_string(),
+                "--manifest-path".to_string(),
+                cargo_project
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        } else {
+            vec!["--version".to_string()]
+        };
+        let cargo_output = run_command_with_backend(
+            &engine,
+            &cwd,
+            ExecutionBackend::Bubblewrap,
+            RunCommandInput {
+                executable: cargo.clone(),
+                args: cargo_args,
+                cwd: Some(workspace.to_string_lossy().into_owned()),
+                env: Some(cargo_env),
+            },
+        )
+        .await
+        .expect("profiled Cargo workload starts");
+        assert_eq!(cargo_output.exit_code, Some(0), "{cargo_output:?}");
+        if cargo_can_check {
+            assert!(
+                cargo_output.stderr.contains("Finished"),
+                "Cargo fixture was not checked: {cargo_output:?}"
+            );
+        } else {
+            assert!(
+                cargo_output.stdout.starts_with("cargo "),
+                "{cargo_output:?}"
+            );
         }
     }
 
