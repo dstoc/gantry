@@ -449,7 +449,7 @@ fn resolve_authorized_cwd(
     resolve_authorized_cwd_absolute(effective_input)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_authorized_cwd_absolute(
     effective_input: PathBuf,
 ) -> Result<AuthorizedCwd, ValidationError> {
@@ -467,10 +467,14 @@ fn resolve_authorized_cwd_absolute(
 
     fn open_root() -> Result<OwnedFd, std::io::Error> {
         let root = CString::new("/").expect("static path has no nul");
+        #[cfg(target_os = "linux")]
+        let directory_flag = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let directory_flag = libc::O_RDONLY;
         let fd = unsafe {
             libc::open(
                 root.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                directory_flag | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -487,11 +491,15 @@ fn resolve_authorized_cwd_absolute(
                 "cwd component contains a nul byte",
             )
         })?;
+        #[cfg(target_os = "linux")]
+        let directory_flag = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let directory_flag = libc::O_RDONLY | libc::O_DIRECTORY;
         let fd = unsafe {
             libc::openat(
                 parent_fd,
                 component.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                directory_flag | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -564,7 +572,7 @@ fn resolve_authorized_cwd_absolute(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_authorized_cwd_absolute(
     effective_input: PathBuf,
 ) -> Result<AuthorizedCwd, ValidationError> {
@@ -1311,6 +1319,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         }));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bubblewrap_setup_failure_never_falls_back_to_direct() {
         let true_path = find_executable("true").expect("true executable");
@@ -1372,30 +1381,34 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         .expect("Direct exit 128 execution");
         assert_eq!(output.exit_code, Some(128));
 
-        if !bubblewrap_capable() {
-            return;
-        }
-        let root = tempfile::tempdir().expect("Bubblewrap policy root");
-        let bubblewrap_engine = policy_engine_with_selection(root.path(), Some("minimal"), None);
-        let output = run_command_with_backend(
-            &bubblewrap_engine,
-            &cwd,
-            ExecutionBackend::Bubblewrap,
-            invoke("kill -TERM $$"),
-        )
-        .await
-        .expect("Bubblewrap signal execution");
-        assert_eq!(output.exit_code, None);
+        #[cfg(target_os = "linux")]
+        {
+            if !bubblewrap_capable() {
+                return;
+            }
+            let root = tempfile::tempdir().expect("Bubblewrap policy root");
+            let bubblewrap_engine =
+                policy_engine_with_selection(root.path(), Some("minimal"), None);
+            let output = run_command_with_backend(
+                &bubblewrap_engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                invoke("kill -TERM $$"),
+            )
+            .await
+            .expect("Bubblewrap signal execution");
+            assert_eq!(output.exit_code, None);
 
-        let output = run_command_with_backend(
-            &bubblewrap_engine,
-            &cwd,
-            ExecutionBackend::Bubblewrap,
-            invoke("exit 128"),
-        )
-        .await
-        .expect("Bubblewrap exit 128 execution");
-        assert_eq!(output.exit_code, Some(128));
+            let output = run_command_with_backend(
+                &bubblewrap_engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                invoke("exit 128"),
+            )
+            .await
+            .expect("Bubblewrap exit 128 execution");
+            assert_eq!(output.exit_code, Some(128));
+        }
     }
 
     #[cfg(target_os = "linux")]

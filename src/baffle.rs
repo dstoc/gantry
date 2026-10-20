@@ -221,10 +221,7 @@ mod tests {
     #[test]
     fn baffle_settings_use_daemon_defaults_and_only_accept_control_socket_override() {
         let defaults = BaffleRuntimeConfig::from_lookup(|_| None);
-        assert_eq!(
-            defaults.control_socket,
-            PathBuf::from("/run/baffle/control.sock")
-        );
+        assert_eq!(defaults.control_socket, default_control_socket());
 
         let configured = BaffleRuntimeConfig::from_lookup(|name| match name {
             "GANTRY_BAFFLE_CONTROL_SOCKET" => Some("/tmp/control.sock".into()),
