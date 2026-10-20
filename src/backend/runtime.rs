@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::filesystem::{FilesystemMount, FilesystemProfile};
 
@@ -9,6 +11,89 @@ use crate::filesystem::{FilesystemMount, FilesystemProfile};
 pub(super) struct RuntimeFile {
     pub(super) source: PathBuf,
     pub(super) target: PathBuf,
+}
+
+const RUNTIME_METADATA_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub(super) struct RuntimeMetadata {
+    library_dirs: Vec<PathBuf>,
+    linker_cache: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl RuntimeMetadata {
+    fn discover() -> Self {
+        Self {
+            library_dirs: library_directories(),
+            linker_cache: linker_cache(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedRuntimeMetadata {
+    value: Arc<RuntimeMetadata>,
+    expires_at: Instant,
+}
+
+/// Reuses host library discovery briefly. The TTL bounds staleness; callers
+/// still inspect and pin every selected dependency for each execution.
+#[derive(Debug)]
+pub(super) struct RuntimeMetadataCache {
+    ttl: Duration,
+    cached: Mutex<Option<CachedRuntimeMetadata>>,
+}
+
+impl RuntimeMetadataCache {
+    pub(super) fn new() -> Self {
+        Self::with_ttl(RUNTIME_METADATA_TTL)
+    }
+
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            cached: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn get(&self) -> Result<Arc<RuntimeMetadata>, String> {
+        self.get_or_load(|| Ok(RuntimeMetadata::discover()))
+    }
+
+    fn get_or_load(
+        &self,
+        load: impl FnOnce() -> Result<RuntimeMetadata, String>,
+    ) -> Result<Arc<RuntimeMetadata>, String> {
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|_| "runtime metadata cache lock was poisoned".to_string())?;
+        let now = Instant::now();
+        if let Some(entry) = cached.as_ref()
+            && now < entry.expires_at
+        {
+            return Ok(entry.value.clone());
+        }
+
+        let value = Arc::new(load()?);
+        let expires_at = Instant::now()
+            .checked_add(self.ttl)
+            .unwrap_or_else(Instant::now);
+        *cached = Some(CachedRuntimeMetadata {
+            value: value.clone(),
+            expires_at,
+        });
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    fn invalidate(&self) -> Result<(), String> {
+        *self
+            .cached
+            .lock()
+            .map_err(|_| "runtime metadata cache lock was poisoned".to_string())? = None;
+        Ok(())
+    }
 }
 
 struct PendingFile {
@@ -24,6 +109,7 @@ pub(super) fn runtime_files(
     executable: &Path,
     supervisor: &Path,
     profile: &FilesystemProfile,
+    metadata: &RuntimeMetadata,
 ) -> Result<Vec<RuntimeFile>, String> {
     let mut files = BTreeMap::<PathBuf, PathBuf>::new();
     let mut inspected = BTreeSet::<PathBuf>::new();
@@ -39,8 +125,8 @@ pub(super) fn runtime_files(
             allow_opaque: false,
         },
     ]);
-    let default_library_dirs = library_directories();
-    let cache = linker_cache();
+    let default_library_dirs = &metadata.library_dirs;
+    let cache = &metadata.linker_cache;
 
     for runtime_path in &profile.runtime_paths {
         let metadata = fs::metadata(&runtime_path.source).map_err(|error| {
@@ -89,7 +175,7 @@ pub(super) fn runtime_files(
         if bytes.starts_with(b"#!") {
             let interpreter = parse_shebang(&bytes)
                 .map_err(|details| format!("invalid shebang in '{}': {details}", path.display()))?;
-            ensure_runtime_interpreter(&interpreter, profile, &default_library_dirs)?;
+            ensure_runtime_interpreter(&interpreter, profile, default_library_dirs)?;
             pending.push_back(PendingFile {
                 path: interpreter,
                 expose_at_path: true,
@@ -111,7 +197,7 @@ pub(super) fn runtime_files(
             format!("cannot inspect ELF file '{}': {details}", path.display())
         })?;
         if let Some(interpreter) = elf.interpreter {
-            ensure_runtime_interpreter(&interpreter, profile, &default_library_dirs)?;
+            ensure_runtime_interpreter(&interpreter, profile, default_library_dirs)?;
             pending.push_back(PendingFile {
                 path: interpreter,
                 expose_at_path: true,
@@ -130,7 +216,7 @@ pub(super) fn runtime_files(
                 let path = PathBuf::from(&needed);
                 if path.is_absolute()
                     && path.is_file()
-                    && (trusted_library_path(&path, &default_library_dirs)
+                    && (trusted_library_path(&path, default_library_dirs)
                         || profile_exposes_path(profile, &path))
                 {
                     path
@@ -144,8 +230,8 @@ pub(super) fn runtime_files(
                 resolve_library(
                     &needed,
                     &search_dirs,
-                    &cache,
-                    &default_library_dirs,
+                    cache,
+                    default_library_dirs,
                     profile,
                 )
                 .ok_or_else(|| {
@@ -533,9 +619,12 @@ fn linker_cache() -> BTreeMap<String, Vec<PathBuf>> {
     let Some(executable) = executable else {
         return BTreeMap::new();
     };
-    let Ok(output) = Command::new(executable).arg("-p").env_clear().output() else {
+    let Ok(output) = Command::new(&executable).arg("-p").env_clear().output() else {
         return BTreeMap::new();
     };
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
     let mut result = BTreeMap::<String, Vec<PathBuf>>::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some((name, location)) = line.split_once("=>") else {
@@ -581,6 +670,77 @@ fn resolve_library(
 mod tests {
     use super::*;
 
+    fn empty_metadata() -> RuntimeMetadata {
+        RuntimeMetadata {
+            library_dirs: Vec::new(),
+            linker_cache: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_metadata_cache_reuses_entries_until_invalidation() {
+        let cache = RuntimeMetadataCache::with_ttl(Duration::from_secs(60));
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let first = cache
+            .get_or_load(|| {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(empty_metadata())
+            })
+            .expect("first metadata load");
+        let reused = cache
+            .get_or_load(|| {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(empty_metadata())
+            })
+            .expect("cached metadata load");
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        cache.invalidate().expect("invalidate metadata cache");
+        let refreshed = cache
+            .get_or_load(|| {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(empty_metadata())
+            })
+            .expect("metadata reload after invalidation");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn runtime_metadata_cache_returns_discovery_errors_and_retries() {
+        let cache = RuntimeMetadataCache::new();
+        let error = cache
+            .get_or_load(|| Err("synthetic discovery failure".to_string()))
+            .expect_err("first discovery should fail");
+        assert_eq!(error, "synthetic discovery failure");
+
+        let metadata = cache
+            .get_or_load(|| Ok(empty_metadata()))
+            .expect("a later discovery should retry");
+        assert!(metadata.library_dirs.is_empty());
+    }
+
+    #[test]
+    fn runtime_metadata_cache_refreshes_after_its_ttl() {
+        let cache = RuntimeMetadataCache::with_ttl(Duration::ZERO);
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            cache
+                .get_or_load(|| {
+                    loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(empty_metadata())
+                })
+                .expect("metadata load");
+        }
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn host_metadata() -> RuntimeMetadata {
+        RuntimeMetadata::discover()
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn discovers_a_real_elf_runtime_and_script_interpreter() {
@@ -589,8 +749,13 @@ mod tests {
             mounts: Vec::new(),
             runtime_paths: Vec::new(),
         };
-        let runtime = runtime_files(Path::new("/usr/bin/true"), Path::new("/bin/sh"), &profile)
-            .expect("system commands have inspectable runtimes");
+        let runtime = runtime_files(
+            Path::new("/usr/bin/true"),
+            Path::new("/bin/sh"),
+            &profile,
+            &host_metadata(),
+        )
+        .expect("system commands have inspectable runtimes");
         assert!(
             runtime
                 .iter()
@@ -626,8 +791,13 @@ mod tests {
             }],
         };
 
-        let runtime = runtime_files(Path::new("/usr/bin/false"), Path::new("/bin/sh"), &profile)
-            .expect("selected runtime path is inspectable");
+        let runtime = runtime_files(
+            Path::new("/usr/bin/false"),
+            Path::new("/bin/sh"),
+            &profile,
+            &host_metadata(),
+        )
+        .expect("selected runtime path is inspectable");
         assert!(runtime.iter().any(|file| file.target == alias));
         assert!(
             !runtime.iter().any(|file| file.target == source),
@@ -650,8 +820,13 @@ mod tests {
             }],
         };
 
-        let runtime = runtime_files(Path::new("/usr/bin/true"), Path::new("/bin/sh"), &profile)
-            .expect("opaque runtime data is allowed");
+        let runtime = runtime_files(
+            Path::new("/usr/bin/true"),
+            Path::new("/bin/sh"),
+            &profile,
+            &host_metadata(),
+        )
+        .expect("opaque runtime data is allowed");
         assert!(runtime.iter().any(|file| file.target == data));
     }
 

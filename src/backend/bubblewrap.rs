@@ -9,6 +9,7 @@ mod linux {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use base64::Engine as _;
@@ -19,7 +20,10 @@ mod linux {
     use tokio::sync::oneshot;
     use tokio::time::{Instant, timeout_at};
 
-    use crate::backend::{StartError, runtime::runtime_files};
+    use crate::backend::{
+        StartError,
+        runtime::{RuntimeMetadataCache, runtime_files},
+    };
     use crate::baffle::{
         BaffleRuntimeConfig, BaffleSessionLease, SANDBOX_CA_CERTIFICATE, SANDBOX_SOCKET,
         create_ephemeral_session,
@@ -33,6 +37,9 @@ mod linux {
     const FIRST_MOUNT_FD: RawFd = 4;
     const STARTUP_TIMEOUT_ENV: &str = "GANTRY_BUBBLEWRAP_STARTUP_TIMEOUT_SECS";
     const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    static BUBBLEWRAP_EXECUTABLE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static RUNTIME_METADATA: OnceLock<RuntimeMetadataCache> = OnceLock::new();
 
     #[derive(Debug, serde::Serialize)]
     struct InvocationMessage<'a> {
@@ -72,6 +79,12 @@ mod linux {
         is_directory: bool,
     }
 
+    pub fn initialize() -> Result<(), String> {
+        bubblewrap_executable()?;
+        runtime_metadata_cache().get()?;
+        Ok(())
+    }
+
     pub async fn start(
         plan: ExecutionPlan,
         baffle: BaffleRuntimeConfig,
@@ -85,8 +98,8 @@ mod linux {
         let diagnostics = ExecutionDiagnostics::from_plan(&plan);
         plan.validate_compatibility().map_err(StartError::Setup)?;
         let supervisor = find_supervisor().map_err(StartError::Setup)?;
-        let bubblewrap = find_bubblewrap().map_err(StartError::Setup)?;
-        validate_bubblewrap(&bubblewrap).map_err(StartError::Setup)?;
+        let bubblewrap = bubblewrap_executable().map_err(StartError::Setup)?;
+        let runtime_metadata = runtime_metadata_cache().get().map_err(StartError::Setup)?;
         let profile = plan.filesystem.as_ref().ok_or_else(|| {
             StartError::Setup("Bubblewrap execution requires a filesystem profile".to_string())
         })?;
@@ -94,8 +107,13 @@ mod linux {
             .validate_profile_sources(profile, None)
             .map_err(StartError::Setup)?;
 
-        let mut runtime = runtime_files(&plan.invocation.executable, &supervisor, profile)
-            .map_err(StartError::Setup)?;
+        let mut runtime = runtime_files(
+            &plan.invocation.executable,
+            &supervisor,
+            profile,
+            &runtime_metadata,
+        )
+        .map_err(StartError::Setup)?;
         let supervisor_runtime = runtime
             .iter_mut()
             .find(|file| file.source == supervisor && file.target == supervisor)
@@ -227,7 +245,7 @@ mod linux {
             );
         }
 
-        let mut command = Command::new(&bubblewrap);
+        let mut command = Command::new(bubblewrap);
         let use_baffle_proxy = baffle_lease.is_some();
         build_bubblewrap_args(&mut command, &mounts, profile);
         let message = InvocationMessage {
@@ -627,6 +645,28 @@ mod linux {
             })
     }
 
+    fn bubblewrap_executable() -> Result<&'static Path, String> {
+        cached_bubblewrap_executable(&BUBBLEWRAP_EXECUTABLE, || {
+            let executable = find_bubblewrap()?;
+            validate_bubblewrap(&executable)?;
+            Ok(executable)
+        })
+    }
+
+    fn cached_bubblewrap_executable(
+        cache: &OnceLock<Result<PathBuf, String>>,
+        load: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<&Path, String> {
+        match cache.get_or_init(load) {
+            Ok(executable) => Ok(executable.as_path()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn runtime_metadata_cache() -> &'static RuntimeMetadataCache {
+        RUNTIME_METADATA.get_or_init(RuntimeMetadataCache::new)
+    }
+
     fn validate_bubblewrap(path: &Path) -> Result<(), String> {
         let version = std::process::Command::new(path)
             .arg("--version")
@@ -653,6 +693,60 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cached_bubblewrap_probe_runs_version_and_help_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("fake Bubblewrap root");
+        let executable = root.path().join("bwrap");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$0.log\"\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' '--ro-bind-fd --bind-fd --unshare-net --as-pid-1'; fi\n",
+        )
+        .expect("write fake Bubblewrap");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make fake Bubblewrap executable");
+
+        let cache = OnceLock::new();
+        let load = || {
+            validate_bubblewrap(&executable)?;
+            Ok(executable.clone())
+        };
+        assert_eq!(
+            cached_bubblewrap_executable(&cache, load).expect("first capability probe"),
+            executable
+        );
+        assert_eq!(
+            cached_bubblewrap_executable(&cache, || panic!("capabilities were probed twice"))
+                .expect("cached capabilities"),
+            executable
+        );
+
+        let calls = fs::read_to_string(executable.with_extension("log"))
+            .expect("read fake Bubblewrap probe log");
+        assert_eq!(calls.lines().collect::<Vec<_>>(), ["--version", "--help"]);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn unsupported_bubblewrap_option_has_a_clear_setup_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("fake Bubblewrap root");
+        let executable = root.path().join("bwrap");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' '--ro-bind-fd --unshare-net --as-pid-1'; fi\n",
+        )
+        .expect("write fake Bubblewrap");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make fake Bubblewrap executable");
+
+        let error = validate_bubblewrap(&executable).expect_err("missing option must fail");
+        assert!(error.contains("does not support required capability --bind-fd"));
     }
 
     fn find_supervisor() -> Result<PathBuf, String> {
@@ -1023,7 +1117,12 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) use linux::start;
+pub(super) use linux::{initialize, start};
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn initialize() -> Result<(), String> {
+    Err("Bubblewrap execution is supported only on Linux".to_string())
+}
 
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn start(

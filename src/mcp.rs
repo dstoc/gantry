@@ -13,6 +13,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
 use thiserror::Error;
 
+use crate::backend;
 use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::ExecutionBackend;
 use crate::executor::{
@@ -273,6 +274,8 @@ pub enum ConfigError {
 pub enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error("execution backend setup failed: {details}")]
+    BackendSetup { details: String },
     #[error("server I/O failure: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -427,6 +430,7 @@ pub(crate) fn build_app_with_baffle_config(
 
 pub async fn serve(config: AppConfig) -> Result<(), AppError> {
     validate_default_cwd(&config.default_cwd)?;
+    backend::initialize(config.backend).map_err(|details| AppError::BackendSetup { details })?;
 
     let policy_engine = Arc::new(PolicyEngine::from_sources(config.policy_dir.clone()));
 
