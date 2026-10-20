@@ -4,13 +4,16 @@ mod runtime;
 
 use std::io;
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 use crate::baffle::BaffleRuntimeConfig;
 use crate::execution::{ExecutionBackend, ExecutionDiagnostics, ExecutionPlan, RunningExecution};
 
+#[derive(Debug)]
 pub(crate) enum StartError {
     Spawn(io::Error),
     Setup(String),
+    StartupTimeout { timeout: Duration },
 }
 
 pub(crate) async fn start(
@@ -40,6 +43,15 @@ pub(crate) async fn start(
                 phase = "setup",
                 failure_class = "backend_setup",
                 "execution setup failed",
+            ),
+            StartError::StartupTimeout { timeout } => tracing::error!(
+                backend = diagnostics.backend.as_str(),
+                filesystem_profile = ?diagnostics.filesystem_profile,
+                baffle_filename = ?diagnostics.baffle_filename,
+                phase = "setup",
+                failure_class = "startup_timeout",
+                startup_timeout_secs = timeout.as_secs(),
+                "execution startup timed out",
             ),
         }
     }
