@@ -1981,7 +1981,7 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         )
         .await
         .expect("profiled Node workload starts");
-        assert_eq!(node_output.stdout, "node-ok");
+        assert_eq!(node_output.stdout, "node-ok", "{node_output:?}");
         assert_eq!(node_output.exit_code, Some(0), "{}", node_output.stderr);
 
         let git = tools.iter().find(|(name, _)| *name == "git").unwrap();
