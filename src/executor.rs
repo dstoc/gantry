@@ -847,6 +847,55 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn node_externalized_package(stderr: &str) -> Option<PathBuf> {
+        let nodejs_dir = Path::new("/usr/share/nodejs");
+        let path = stderr.split("/usr/share/nodejs/").nth(1)?;
+        let mut components = path.split('/');
+        let first = components.next()?;
+        if first.is_empty() || first == "." || first == ".." {
+            return None;
+        }
+        let package = if first.starts_with('@') {
+            let name = components.next()?;
+            if name.is_empty() || name == "." || name == ".." {
+                return None;
+            }
+            PathBuf::from(first).join(name)
+        } else {
+            PathBuf::from(first)
+        };
+        let package_dir = nodejs_dir.join(package);
+        package_dir.starts_with(nodejs_dir).then_some(package_dir)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_externalized_package_selects_only_the_named_package_directory() {
+        assert_eq!(
+            node_externalized_package(
+                "Cannot load externalized builtin: internal/deps/lexer:/usr/share/nodejs/cjs-module-lexer/dist/lexer.js"
+            ),
+            Some(PathBuf::from("/usr/share/nodejs/cjs-module-lexer"))
+        );
+        assert_eq!(
+            node_externalized_package(
+                "Cannot load externalized builtin: internal/deps/fetch:/usr/share/nodejs/undici/undici-fetch.js"
+            ),
+            Some(PathBuf::from("/usr/share/nodejs/undici"))
+        );
+        assert_eq!(
+            node_externalized_package(
+                "Cannot load externalized builtin: internal/deps/pkg:/usr/share/nodejs/@scope/pkg/index.js"
+            ),
+            Some(PathBuf::from("/usr/share/nodejs/@scope/pkg"))
+        );
+        assert_eq!(
+            node_externalized_package("Cannot load externalized builtin: /usr/share/nodejs/../"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn bubblewrap_capable() -> bool {
         crate::backend::host_has_required_bubblewrap()
     }
@@ -1965,60 +2014,66 @@ decision := {"allow": true, "filesystem": "missing-profile", "baffle_session": n
         assert_eq!(direct_python.exit_code, Some(0), "{}", direct_python.stderr);
 
         let node = tools.iter().find(|(name, _)| *name == "node").unwrap();
-        // Debian's Node package externalizes this builtin in a package directory,
-        // but the file layout differs between Debian releases (for example,
-        // `lexer.js` versus `dist/lexer.js`). Select only that package directory.
-        let node_builtin_dir = PathBuf::from("/usr/share/nodejs/cjs-module-lexer");
-        if node_builtin_dir.is_dir() {
-            let node_without_builtin = run_command_with_backend(
-                &engine,
-                &cwd,
-                ExecutionBackend::Bubblewrap,
-                RunCommandInput {
-                    executable: node.1.clone(),
-                    args: vec![
-                        "-e".to_string(),
-                        "process.stdout.write('node-ok')".to_string(),
-                    ],
-                    cwd: Some(workspace.to_string_lossy().into_owned()),
-                    env: None,
-                },
-            )
-            .await
-            .expect("Node without its selected builtin is a command failure");
-            assert_ne!(
-                node_without_builtin.exit_code,
-                Some(0),
-                "Node unexpectedly ran without its externalized builtin"
-            );
-            assert!(
-                node_without_builtin
-                    .stderr
-                    .contains("/usr/share/nodejs/cjs-module-lexer/"),
-                "missing Node builtin should be identified clearly: {node_without_builtin:?}"
-            );
-            runtime_paths.push(node_builtin_dir.to_string_lossy().into_owned());
-            write_profile(&runtime_paths);
-        }
-        let engine = PolicyEngine::from_sources(Some(policy_dir));
-        let node_output = run_command_with_backend(
-            &engine,
+        let node_input = || RunCommandInput {
+            executable: node.1.clone(),
+            args: vec![
+                "-e".to_string(),
+                "process.stdout.write('node-ok')".to_string(),
+            ],
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            env: None,
+        };
+        let mut node_engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+        let mut node_output = run_command_with_backend(
+            &node_engine,
             &cwd,
             ExecutionBackend::Bubblewrap,
-            RunCommandInput {
-                executable: node.1.clone(),
-                args: vec![
-                    "-e".to_string(),
-                    "process.stdout.write('node-ok')".to_string(),
-                ],
-                cwd: Some(workspace.to_string_lossy().into_owned()),
-                env: None,
-            },
+            node_input(),
         )
         .await
-        .expect("profiled Node workload starts");
+        .expect("Node without an externalized builtin is a command failure");
+        for _ in 0..8 {
+            if node_output.exit_code == Some(0) {
+                break;
+            }
+            assert!(
+                node_output
+                    .stderr
+                    .contains("Cannot load externalized builtin"),
+                "missing Node dependency should be identified clearly: {node_output:?}"
+            );
+            let node_package =
+                node_externalized_package(&node_output.stderr).unwrap_or_else(|| {
+                    panic!(
+                        "Node failure did not identify a /usr/share/nodejs package: {node_output:?}"
+                    )
+                });
+            assert!(
+                node_package.is_dir(),
+                "Node named a missing package directory: {} ({node_output:?})",
+                node_package.display()
+            );
+            let selected_package = node_package.to_string_lossy().into_owned();
+            assert!(
+                !runtime_paths.contains(&selected_package),
+                "Node still reports an externalized builtin from already selected package {}: {node_output:?}",
+                node_package.display()
+            );
+            runtime_paths.push(selected_package);
+            write_profile(&runtime_paths);
+            node_engine = PolicyEngine::from_sources(Some(policy_dir.clone()));
+            node_output = run_command_with_backend(
+                &node_engine,
+                &cwd,
+                ExecutionBackend::Bubblewrap,
+                node_input(),
+            )
+            .await
+            .expect("profiled Node workload starts");
+        }
         assert_eq!(node_output.stdout, "node-ok", "{node_output:?}");
         assert_eq!(node_output.exit_code, Some(0), "{}", node_output.stderr);
+        let engine = node_engine;
 
         let git = tools.iter().find(|(name, _)| *name == "git").unwrap();
         assert!(
