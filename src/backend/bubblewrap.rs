@@ -242,9 +242,7 @@ mod linux {
 
         let stdin_result = async {
             let mut stdin = execution
-                .child_mut()
-                .stdin
-                .take()
+                .take_startup_stdin()
                 .ok_or_else(|| io::Error::other("Bubblewrap launcher stdin pipe is missing"))?;
             let message = InvocationMessage {
                 executable: &plan.invocation.executable,
@@ -260,16 +258,16 @@ mod linux {
         }
         .await;
         if let Err(error) = stdin_result {
-            terminate_launcher(execution.child_mut()).await;
+            execution.cancel().await;
             return Err(StartError::Setup(format!(
                 "failed to send the authorized invocation to the Bubblewrap supervisor: {error}"
             )));
         }
 
-        let stdout = match execution.child_mut().stdout.take() {
+        let stdout = match execution.take_startup_stdout() {
             Some(stdout) => stdout,
             None => {
-                terminate_launcher(execution.child_mut()).await;
+                execution.cancel().await;
                 return Err(StartError::Setup(
                     "Bubblewrap supervisor stdout pipe is missing".to_string(),
                 ));
@@ -280,7 +278,7 @@ mod linux {
         let read_result = status_reader.read_line(&mut line).await;
         let status = match read_result {
             Ok(0) => {
-                let diagnostics = launcher_diagnostics(execution.child_mut()).await;
+                let diagnostics = launcher_diagnostics(&mut execution).await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap exited before the authorized command started{diagnostics}"
                 )));
@@ -288,14 +286,14 @@ mod linux {
             Ok(_) => match serde_json::from_str::<SupervisorMessage>(&line) {
                 Ok(status) => status,
                 Err(error) => {
-                    terminate_launcher(execution.child_mut()).await;
+                    execution.cancel().await;
                     return Err(StartError::Setup(format!(
                         "Bubblewrap supervisor returned an invalid startup status: {error}"
                     )));
                 }
             },
             Err(error) => {
-                terminate_launcher(execution.child_mut()).await;
+                execution.cancel().await;
                 return Err(StartError::Setup(format!(
                     "failed to read Bubblewrap supervisor startup status: {error}"
                 )));
@@ -304,13 +302,13 @@ mod linux {
         match status {
             SupervisorMessage::Started => {}
             SupervisorMessage::SetupError { error } => {
-                terminate_launcher(execution.child_mut()).await;
+                execution.cancel().await;
                 return Err(StartError::Setup(format!(
                     "Bubblewrap command startup failed: {error}"
                 )));
             }
             _ => {
-                terminate_launcher(execution.child_mut()).await;
+                execution.cancel().await;
                 return Err(StartError::Setup(
                     "Bubblewrap supervisor returned an unexpected startup status".to_string(),
                 ));
@@ -336,9 +334,7 @@ mod linux {
         });
         let stdout: crate::execution::OutputReader = Box::new(stdout_reader);
         let stderr = execution
-            .child_mut()
-            .stderr
-            .take()
+            .take_startup_stderr()
             .map(|reader| Box::new(reader) as crate::execution::OutputReader);
         execution.set_streams(Some(stdout), stderr, final_status_rx);
         Ok(execution)
@@ -693,29 +689,19 @@ mod linux {
         Ok(())
     }
 
-    async fn terminate_launcher(child: &mut tokio::process::Child) {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
-
-    async fn launcher_diagnostics(child: &mut tokio::process::Child) -> String {
-        if let Some(mut stderr) = child.stderr.take() {
-            let mut message = String::new();
-            let _ = stderr.read_to_string(&mut message).await;
-            let _ = child.wait().await;
-            if message.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", message.trim())
-            }
+    async fn launcher_diagnostics(execution: &mut RunningExecution) -> String {
+        let mut message = String::new();
+        if let Some(mut stderr) = execution.take_startup_stderr() {
+            let (read_result, _) =
+                tokio::join!(stderr.read_to_string(&mut message), execution.cancel());
+            let _ = read_result;
         } else {
-            let _ = child.wait().await;
+            execution.cancel().await;
+        }
+        if message.trim().is_empty() {
             String::new()
+        } else {
+            format!(": {}", message.trim())
         }
     }
 

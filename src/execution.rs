@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::AsyncRead;
-use tokio::process::Child;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::oneshot;
 
 use crate::filesystem::FilesystemProfile;
@@ -111,12 +111,16 @@ impl ExecutionPlan {
 pub(crate) struct RunningExecution {
     child: Child,
     process_group: Option<i32>,
+    #[cfg(unix)]
+    exit_observer: Option<tokio::task::JoinHandle<io::Result<()>>>,
     stdout: Option<OutputReader>,
     stderr: Option<OutputReader>,
     final_status: Option<FinalStatusReceiver>,
     completed_status: Option<ExecutionExitStatus>,
     baffle_lease: Option<crate::baffle::BaffleSessionLease>,
     diagnostics: ExecutionDiagnostics,
+    #[cfg(test)]
+    group_signal_observer: Option<Box<dyn FnOnce(Option<u32>) + Send>>,
 }
 
 pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -172,29 +176,25 @@ impl ExecutionExitStatus {
 type FinalStatusReceiver = oneshot::Receiver<Result<ExecutionExitStatus, io::Error>>;
 
 #[cfg(unix)]
-async fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        loop {
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
         }
-    })
-    .await
-    .map_err(io::Error::other)?
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 impl RunningExecution {
@@ -230,12 +230,16 @@ impl RunningExecution {
         Self {
             child,
             process_group,
+            #[cfg(unix)]
+            exit_observer: None,
             stdout: None,
             stderr: None,
             final_status: None,
             completed_status: None,
             baffle_lease,
             diagnostics,
+            #[cfg(test)]
+            group_signal_observer: None,
         }
     }
 
@@ -247,8 +251,16 @@ impl RunningExecution {
         self.diagnostics.baffle_session_id.as_deref()
     }
 
-    pub(crate) fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+    pub(crate) fn take_startup_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub(crate) fn take_startup_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_startup_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
     }
 
     pub(crate) fn set_streams(
@@ -277,11 +289,27 @@ impl RunningExecution {
         #[cfg(unix)]
         if self.process_group.is_some() {
             if let Some(pid) = self.child.id() {
-                if let Err(error) = wait_for_exit_without_reaping(pid).await {
-                    self.terminate_descendants();
-                    let _ = self.child.start_kill();
-                    let _ = self.child.wait().await;
-                    return Err(error);
+                if self.exit_observer.is_none() {
+                    self.exit_observer = Some(tokio::task::spawn_blocking(move || {
+                        wait_for_exit_without_reaping(pid)
+                    }));
+                }
+                let observer_result = self
+                    .exit_observer
+                    .as_mut()
+                    .expect("exit observer was created")
+                    .await;
+                self.exit_observer = None;
+                match observer_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        self.cancel().await;
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        self.cancel().await;
+                        return Err(io::Error::other(error));
+                    }
                 }
                 self.terminate_descendants();
             } else {
@@ -326,6 +354,10 @@ impl RunningExecution {
         let baffle_session_id = self.diagnostics.baffle_session_id.clone();
         self.terminate_descendants();
         let _ = self.child.start_kill();
+        #[cfg(unix)]
+        if let Some(observer) = self.exit_observer.take() {
+            let _ = observer.await;
+        }
         let _ = self.child.wait().await;
         self.baffle_lease.take();
         tracing::info!(
@@ -342,8 +374,15 @@ impl RunningExecution {
     fn terminate_descendants(&mut self) {
         #[cfg(unix)]
         if let Some(process_group) = self.process_group.take() {
-            unsafe {
-                libc::kill(-(process_group as libc::pid_t), libc::SIGKILL);
+            let launcher_pid = self.child.id();
+            if launcher_pid == Some(process_group as u32) {
+                unsafe {
+                    libc::kill(-(process_group as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            #[cfg(test)]
+            if let Some(observer) = self.group_signal_observer.take() {
+                observer(launcher_pid);
             }
         }
     }
@@ -585,9 +624,7 @@ mod tests {
                 },
             );
             let stdout = execution
-                .child_mut()
-                .stdout
-                .take()
+                .take_startup_stdout()
                 .expect("launcher status pipe");
             let mut status_reader = BufReader::new(ReadObserved {
                 inner: stdout,
@@ -703,5 +740,99 @@ mod tests {
         assert_eq!("direct".parse(), Ok(ExecutionBackend::Direct));
         assert_eq!("bubblewrap".parse(), Ok(ExecutionBackend::Bubblewrap));
         assert!("Direct".parse::<ExecutionBackend>().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_failure_cleanup_signals_group_while_launcher_pid_is_reserved() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let started = directory.path().join("descendant-started");
+        let marker = directory.path().join("descendant-survived");
+        let child = spawn_test_process_group(
+            "(touch \"$STARTED_MARKER\"; sleep 0.5; touch \"$LATE_MARKER\") & exit 23",
+            &started,
+            &marker,
+        );
+        let pid = child.id().expect("launcher PID");
+        let mut execution = RunningExecution::new(child, true, test_diagnostics());
+        let (signalled_pid_tx, signalled_pid_rx) = oneshot::channel();
+        execution.group_signal_observer = Some(Box::new(move |signalled_pid| {
+            let _ = signalled_pid_tx.send(signalled_pid);
+        }));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant started");
+        tokio::task::spawn_blocking(move || wait_for_exit_without_reaping(pid))
+            .await
+            .expect("exit observer task")
+            .expect("launcher exits without being reaped");
+
+        execution.cancel().await;
+        assert_eq!(
+            signalled_pid_rx.await.expect("group signal observation"),
+            Some(pid),
+            "startup cleanup must signal the group while the launcher PID is still reserved"
+        );
+        assert!(
+            execution.child.id().is_none(),
+            "launcher was reaped by cleanup"
+        );
+        assert!(
+            execution.process_group.is_none(),
+            "group ownership was consumed"
+        );
+        drop(execution);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "startup cleanup left a descendant running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_wait_futures_reuse_one_exit_observer() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let unused_marker = directory.path().join("unused-marker");
+        let child = spawn_test_process_group("sleep 30", &unused_marker, &unused_marker);
+        let mut execution = RunningExecution::new(child, true, test_diagnostics());
+        let mut observer_id = None;
+
+        for _ in 0..3 {
+            {
+                let wait = execution.wait();
+                tokio::pin!(wait);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut wait)
+                        .await
+                        .is_err(),
+                    "the live child must keep wait pending"
+                );
+            }
+            let current_id = execution
+                .exit_observer
+                .as_ref()
+                .expect("cancelled wait retains its exit observer")
+                .id();
+            if let Some(observer_id) = observer_id {
+                assert_eq!(
+                    current_id, observer_id,
+                    "wait polling spawned another observer"
+                );
+            } else {
+                observer_id = Some(current_id);
+            }
+        }
+
+        execution.cancel().await;
     }
 }
