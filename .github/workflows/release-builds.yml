@@ -15,6 +15,11 @@ on:
         description: Release version, or empty to read Cargo.toml
         required: false
         type: string
+    tools_ref:
+      description: Commit that contains measurement tools, or empty to use the build ref
+      required: false
+      type: string
+      default: ""
 
 permissions:
   contents: read
@@ -42,6 +47,14 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        if: inputs.tools_ref != '' && inputs.tools_ref != inputs.ref
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.tools_ref }}
+          path: .workflow-tools
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
@@ -115,6 +128,20 @@ jobs:
           install -m 0644 docs/reference.md "$stage/docs/reference.md"
           tar -czf "$RUNNER_TEMP/$package.tar.gz" -C "$RUNNER_TEMP/package" "$package"
           python3 scripts/release_assets.py archive "$VERSION" "$PLATFORM" "$RUNNER_TEMP/$package.tar.gz"
+          size_report="$RUNNER_TEMP/release-sizes.md"
+          measure_script=scripts/release_assets.py
+          if [[ -f .workflow-tools/scripts/release_assets.py ]]; then
+            measure_script=.workflow-tools/scripts/release_assets.py
+          fi
+          python3 "$measure_script" sizes \
+            "$VERSION" "$PLATFORM" "$RUNNER_TEMP/$package.tar.gz" > "$size_report"
+          {
+            printf 'Source commit: `%s`\n\n' "$(git rev-parse HEAD)"
+            printf 'Compiler: `%s`\n\n' "$(rustc -V)"
+            printf 'Build: `cargo build --locked --release --bins --target %s`\n\n' "$TARGET"
+            cat "$size_report"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Release size measurement::$(tail -n 1 "$size_report")"
 
       - uses: actions/upload-artifact@v4
         with:

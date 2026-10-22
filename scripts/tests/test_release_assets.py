@@ -84,6 +84,25 @@ class ReleaseAssetsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not executable"):
             release_assets.create_checksums(VERSION, self.directory)
 
+    def test_size_report_reads_binary_sizes_and_final_archive_size(self) -> None:
+        platform = release_assets.PLATFORMS[0]
+        archive = self.directory / release_assets.expected_archives(VERSION)[0]
+
+        binary_sizes, archive_size = release_assets.measure_archive(archive, VERSION, platform)
+
+        self.assertEqual(
+            binary_sizes,
+            {
+                name: len(f"fixture for {name}\n".encode())
+                for name in release_assets.BINARIES
+            },
+        )
+        self.assertEqual(archive_size, archive.stat().st_size)
+        report = release_assets.format_size_report(VERSION, platform, archive)
+        self.assertIn(f"| {platform} |", report)
+        self.assertIn(str(binary_sizes["gantry"]), report)
+        self.assertIn(f"| {archive_size} |", report)
+
     def test_extra_downloaded_asset_fails_verification(self) -> None:
         release_assets.create_checksums(VERSION, self.directory)
         (self.directory / "unexpected.txt").write_text("stale")

@@ -78,6 +78,43 @@ def verify_archive(path: Path, version: str, platform: str) -> None:
         raise ValueError(f"archive contents do not match {path.name}; missing={missing}, extra={extra}")
 
 
+def measure_archive(path: Path, version: str, platform: str) -> tuple[dict[str, int], int]:
+    expected_name = f"gantry-{version}-{platform}.tar.gz"
+    if path.name != expected_name:
+        raise ValueError(f"expected archive name {expected_name}, got {path.name}")
+    verify_archive(path, version, platform)
+
+    root = f"gantry-{version}-{platform}"
+    with tarfile.open(path, mode="r:gz") as archive:
+        binary_sizes = {
+            name: archive.getmember(f"{root}/{name}").size for name in BINARIES
+        }
+    return binary_sizes, path.stat().st_size
+
+
+def format_size_report(version: str, platform: str, path: Path) -> str:
+    binary_sizes, archive_size = measure_archive(path, version, platform)
+    headers = " | ".join(
+        ("Platform", *(f"{name} bytes" for name in BINARIES), "Archive bytes")
+    )
+    values = " | ".join(
+        (
+            platform,
+            *(str(binary_sizes[name]) for name in BINARIES),
+            str(archive_size),
+        )
+    )
+    return "\n".join(
+        (
+            f"### Release size: {version}",
+            "",
+            f"| {headers} |",
+            f"| {' | '.join(['---'] * 5)} |",
+            f"| {values} |",
+        )
+    )
+
+
 def require_files(directory: Path, names: set[str]) -> None:
     if not directory.is_dir():
         raise ValueError(f"asset directory does not exist: {directory}")
@@ -141,6 +178,10 @@ def main() -> int:
     archive_parser.add_argument("version")
     archive_parser.add_argument("platform", choices=PLATFORMS)
     archive_parser.add_argument("archive", type=Path)
+    sizes_parser = subparsers.add_parser("sizes")
+    sizes_parser.add_argument("version")
+    sizes_parser.add_argument("platform", choices=PLATFORMS)
+    sizes_parser.add_argument("archive", type=Path)
     args = parser.parse_args()
 
     try:
@@ -148,6 +189,8 @@ def main() -> int:
             create_checksums(args.version, args.directory)
         elif args.command == "verify":
             verify_assets(args.version, args.directory)
+        elif args.command == "sizes":
+            print(format_size_report(args.version, args.platform, args.archive))
         else:
             expected_name = f"gantry-{args.version}-{args.platform}.tar.gz"
             if args.archive.name != expected_name:
