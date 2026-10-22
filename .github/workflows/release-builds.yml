@@ -1,0 +1,124 @@
+name: Release builds
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        required: true
+        type: string
+      repository:
+        description: Repository that contains the commit
+        required: true
+        type: string
+      version:
+        description: Release version, or empty to read Cargo.toml
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64-gnu
+            runner: ubuntu-22.04
+            machine: Advanced Micro Devices X86-64
+          - target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64-gnu
+            runner: ubuntu-22.04-arm
+            machine: AArch64
+          - target: aarch64-apple-darwin
+            platform: darwin-aarch64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Resolve package version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          if [[ -z "$version" ]]; then
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable package version; received '$version'." >&2
+            exit 1
+          fi
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "$cargo_version" = "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bins --target "$TARGET"
+
+          bin_dir="target/$TARGET/release"
+          for binary in gantry gantry-supervisor run-remote; do
+            test -x "$bin_dir/$binary"
+            file "$bin_dir/$binary"
+            if [[ "$TARGET" == *-linux-gnu ]]; then
+              machine="$(readelf -h "$bin_dir/$binary" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+              test "$machine" = "$EXPECTED_MACHINE"
+            else
+              test "$(lipo -archs "$bin_dir/$binary")" = arm64
+            fi
+          done
+
+          "$bin_dir/gantry" --help > "$RUNNER_TEMP/gantry-help.txt"
+          grep -q 'Bubblewrap is the default' "$RUNNER_TEMP/gantry-help.txt"
+
+          set +e
+          printf '{}' | "$bin_dir/gantry-supervisor" > "$RUNNER_TEMP/supervisor.out" 2> "$RUNNER_TEMP/supervisor.err"
+          supervisor_status=$?
+          set -e
+          test "$supervisor_status" -eq 125
+          grep -q '"status":"setup_error"' "$RUNNER_TEMP/supervisor.out"
+
+          set +e
+          env -u RUN_REMOTE_SERVER -u RUN_REMOTE_SOCKET "$bin_dir/run-remote" -- date > "$RUNNER_TEMP/run-remote.out" 2> "$RUNNER_TEMP/run-remote.err"
+          remote_status=$?
+          set -e
+          test "$remote_status" -eq 125
+          grep -q 'RUN_REMOTE_SERVER must be set' "$RUNNER_TEMP/run-remote.err"
+
+          package="gantry-$VERSION-$PLATFORM"
+          stage="$RUNNER_TEMP/package/$package"
+          mkdir -p "$stage/docs"
+          install -m 0755 "$bin_dir/gantry" "$stage/gantry"
+          install -m 0755 "$bin_dir/gantry-supervisor" "$stage/gantry-supervisor"
+          install -m 0755 "$bin_dir/run-remote" "$stage/run-remote"
+          install -m 0644 LICENSE README.md "$stage/"
+          install -m 0644 docs/reference.md "$stage/docs/reference.md"
+          tar -czf "$RUNNER_TEMP/$package.tar.gz" -C "$RUNNER_TEMP/package" "$package"
+          python3 scripts/release_assets.py archive "$VERSION" "$PLATFORM" "$RUNNER_TEMP/$package.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: ${{ runner.temp }}/gantry-${{ steps.version.outputs.value }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
