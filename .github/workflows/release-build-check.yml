@@ -3,6 +3,11 @@ name: Release build verification
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source ref to measure (for example, v0.4.8)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -11,5 +16,6 @@ jobs:
   release-builds:
     uses: ./.github/workflows/release-builds.yml
     with:
-      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.source_ref || github.sha }}
+      tools_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
