@@ -13,15 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  baseline-measurement:
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/15-optimize-release-binary-sizes'
-    uses: ./.github/workflows/release-builds.yml
-    with:
-      ref: fa9b85737c4aab055486c23f7fa7d12f4c76e06a
-      tools_ref: ${{ github.event.pull_request.head.sha }}
-      repository: dstoc/gantry
-      version: "0.4.8"
-
   release-builds:
     uses: ./.github/workflows/release-builds.yml
     with:
