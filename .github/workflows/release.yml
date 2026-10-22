@@ -39,16 +39,18 @@ jobs:
           manifest-file: .release-please-manifest.json
           target-branch: main
 
-      - name: Run the required CI check on the release pull request
+      - name: Check out the CI dispatch helper
+        if: steps.release.outputs.pr != ''
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Dispatch the required CI check on the release pull request
         if: steps.release.outputs.pr != ''
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PR: ${{ steps.release.outputs.pr }}
-        run: |
-          set -euo pipefail
-          release_branch="$(jq -er 'if type == "string" then (fromjson | .head.ref) else .head.ref end' <<< "$RELEASE_PR")"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
-            --field "ref=$release_branch" > /dev/null
+        run: ./scripts/dispatch_release_pr_ci.sh
 
   prepare:
     needs: release-please
