@@ -15,11 +15,11 @@ on:
         description: Release version, or empty to read Cargo.toml
         required: false
         type: string
-    tools_ref:
-      description: Commit that contains measurement tools, or empty to use the build ref
-      required: false
-      type: string
-      default: ""
+      tools_ref:
+        description: Commit that contains measurement tools, or empty to use the build ref
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
