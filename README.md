@@ -89,6 +89,12 @@ The manifest starts at version `0.4.7`, which matches `Cargo.toml`. Its
 bootstrap commit keeps older repository history out of the first generated
 changelog. Release tags use the form `vX.Y.Z`.
 
+To request a specific version when conventional commits do not select one, add
+`Release-As: X.Y.Z` to the body of a commit on `main`. For a squash-merged pull
+request, include this footer in the pull request body and preserve it in the
+squash commit body. Release Please then opens a version and changelog pull
+request for that version.
+
 Release Please uses the workflow token, so its tag does not start a second
 workflow run. The release workflow passes the tag and commit SHA to its build
 and publish jobs in the same run. Its workflow token also does not start the
