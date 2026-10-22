@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "scripts" / "dispatch_release_pr_ci.sh"
+SCRIPT = ROOT / "scripts" / "dispatch_release_pr_checks.sh"
 
 
 class ReleasePrDispatchTests(unittest.TestCase):
@@ -22,7 +22,7 @@ class ReleasePrDispatchTests(unittest.TestCase):
         gh = self.bin_directory / "gh"
         gh.write_text(
             "#!/bin/sh\n"
-            'printf \'%s\\n\' "$@" > "$RELEASE_DISPATCH_CAPTURE"\n'
+            'printf \'%s\\n\' "$@" >> "$RELEASE_DISPATCH_CAPTURE"\n'
         )
         gh.chmod(0o755)
 
@@ -48,7 +48,7 @@ class ReleasePrDispatchTests(unittest.TestCase):
             env=environment,
         )
 
-    def test_action_output_head_branch_name_is_dispatched_to_ci(self) -> None:
+    def test_action_output_head_branch_name_is_dispatched_to_required_checks(self) -> None:
         action_output = json.dumps(
             {
                 "headBranchName": "release-please--branches--main",
@@ -71,6 +71,12 @@ class ReleasePrDispatchTests(unittest.TestCase):
                 "--method",
                 "POST",
                 "repos/dstoc/gantry/actions/workflows/ci.yml/dispatches",
+                "--field",
+                "ref=release-please--branches--main",
+                "api",
+                "--method",
+                "POST",
+                "repos/dstoc/gantry/actions/workflows/release-build-check.yml/dispatches",
                 "--field",
                 "ref=release-please--branches--main",
             ],

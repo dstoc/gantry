@@ -45,12 +45,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Dispatch the required CI check on the release pull request
+      - name: Dispatch required checks on the release pull request
         if: steps.release.outputs.pr != ''
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PR: ${{ steps.release.outputs.pr }}
-        run: ./scripts/dispatch_release_pr_ci.sh
+        run: ./scripts/dispatch_release_pr_checks.sh
 
   prepare:
     needs: release-please

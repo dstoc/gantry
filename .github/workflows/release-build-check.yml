@@ -2,6 +2,7 @@ name: Release build verification
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,5 +11,5 @@ jobs:
   release-builds:
     uses: ./.github/workflows/release-builds.yml
     with:
-      ref: ${{ github.event.pull_request.head.sha }}
-      repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}

@@ -17,3 +17,6 @@ fi
 
 gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
   --field "ref=$release_branch" > /dev/null
+
+gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/release-build-check.yml/dispatches" \
+  --field "ref=$release_branch" > /dev/null
