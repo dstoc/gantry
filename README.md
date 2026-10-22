@@ -98,8 +98,9 @@ request for that version.
 Release Please uses the workflow token, so its tag does not start a second
 workflow run. The release workflow passes the tag and commit SHA to its build
 and publish jobs in the same run. Its workflow token also does not start the
-normal pull request checks, so it dispatches the existing CI workflow on the
-release branch to produce the required `test` check.
+normal pull request checks, so it dispatches the CI and release-build-check
+workflows on the release branch. These runs report their checks against the
+release pull request commit.
 
 The release workflow builds all three targets from that tag's commit. It checks
 the target architecture, runs binary smoke checks, packages the binaries and
