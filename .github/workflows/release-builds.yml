@@ -135,12 +135,15 @@ jobs:
           fi
           python3 "$measure_script" sizes \
             "$VERSION" "$PLATFORM" "$RUNNER_TEMP/$package.tar.gz" > "$size_report"
+          source_commit="$(git rev-parse HEAD)"
+          compiler_version="$(rustc -V)"
           {
-            printf 'Source commit: `%s`\n\n' "$(git rev-parse HEAD)"
-            printf 'Compiler: `%s`\n\n' "$(rustc -V)"
+            printf 'Source commit: `%s`\n\n' "$source_commit"
+            printf 'Compiler: `%s`\n\n' "$compiler_version"
             printf 'Build: `cargo build --locked --release --bins --target %s`\n\n' "$TARGET"
             cat "$size_report"
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Release build details::source=$source_commit; compiler=$compiler_version; target=$TARGET"
           echo "::notice title=Release size measurement::$(tail -n 1 "$size_report")"
 
       - uses: actions/upload-artifact@v4
