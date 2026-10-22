@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test-macos:
@@ -31,6 +32,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Validate release archive gates
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Build
         run: cargo build --locked --bins
       - name: Clippy

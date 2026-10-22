@@ -1,0 +1,285 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to rebuild and publish (for example, v0.4.8)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main
+
+      - name: Check out the CI dispatch helper
+        if: steps.release.outputs.pr != ''
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Dispatch the required CI check on the release pull request
+        if: steps.release.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: ./scripts/dispatch_release_pr_ci.sh
+
+  prepare:
+    needs: release-please
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      proceed: ${{ steps.resolve.outputs.proceed }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_id: ${{ steps.resolve.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate the build commit
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_PLEASE_RESULT: ${{ needs.release-please.result }}
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "Recovery runs must use the workflow on main." >&2
+              exit 1
+            fi
+            tag="$INPUT_TAG"
+            expected_sha=""
+          elif [[ "$RELEASE_PLEASE_RESULT" != "success" ]]; then
+            echo "Release Please did not complete successfully." >&2
+            exit 1
+          elif [[ "$RELEASE_CREATED" == "true" ]]; then
+            tag="$RELEASE_TAG"
+            expected_sha="$RELEASE_SHA"
+            if [[ -z "$expected_sha" ]]; then
+              echo "Release Please did not report the release commit SHA." >&2
+              exit 1
+            fi
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Release Please did not create a release; no build is needed."
+            exit 0
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable version tag such as v0.4.8; received '$tag'." >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+          tag_sha="$(git rev-parse "${tag}^{commit}")"
+          if [[ -n "$expected_sha" && "$tag_sha" != "$expected_sha" ]]; then
+            echo "Release Please reported $expected_sha, but $tag resolves to $tag_sha." >&2
+            exit 1
+          fi
+
+          mapfile -t release_ids < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$tag\") | .id")
+          if [[ "${#release_ids[@]}" -ne 1 ]]; then
+            echo "Expected one GitHub release for $tag; found ${#release_ids[@]}." >&2
+            exit 1
+          fi
+          release_id="${release_ids[0]}"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          release_tag="$(jq -r '.tag_name' <<< "$release_json")"
+          is_draft="$(jq -r '.draft' <<< "$release_json")"
+          if [[ "$release_tag" != "$tag" || "$is_draft" != "true" ]]; then
+            echo "Release $tag must exist as a draft with the same tag." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          cargo_version="$(git show "$tag_sha:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)"
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "Tag $tag points to Cargo.toml version $cargo_version." >&2
+            exit 1
+          fi
+
+          {
+            echo "proceed=true"
+            echo "tag=$tag"
+            echo "sha=$tag_sha"
+            echo "version=$version"
+            echo "release_id=$release_id"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    uses: ./.github/workflows/release-builds.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      repository: ${{ github.repository }}
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.proceed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
+
+      - name: Create and verify checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_assets.py checksums "$VERSION" "$RUNNER_TEMP/release-assets"
+          python3 scripts/release_assets.py verify "$VERSION" "$RUNNER_TEMP/release-assets"
+
+      - name: Reconcile draft assets and verify uploaded bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_SHA"
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          release_id="$RELEASE_ID"
+          test "$(jq -r '.tag_name' <<< "$release_json")" = "$RELEASE_TAG"
+          test "$(jq -r '.draft' <<< "$release_json")" = true
+
+          while IFS= read -r asset_id; do
+            [[ -z "$asset_id" ]] || gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '.[].id')
+
+          upload_url="$(jq -r '.upload_url | split("{")[0]' <<< "$release_json")"
+          for asset_name in \
+            "gantry-$VERSION-linux-x86_64-gnu.tar.gz" \
+            "gantry-$VERSION-linux-aarch64-gnu.tar.gz" \
+            "gantry-$VERSION-darwin-aarch64.tar.gz" \
+            SHA256SUMS; do
+            curl --fail --silent --show-error --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$RUNNER_TEMP/release-assets/$asset_name" \
+              "$upload_url?name=$asset_name" > /dev/null
+          done
+
+          expected_assets="$(printf '%s\n' \
+            "gantry-$VERSION-darwin-aarch64.tar.gz" \
+            "gantry-$VERSION-linux-aarch64-gnu.tar.gz" \
+            "gantry-$VERSION-linux-x86_64-gnu.tar.gz" \
+            SHA256SUMS | sort)"
+          release_assets="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '.[].name' | sort)"
+          test "$release_assets" = "$expected_assets"
+
+          verify_dir="$RUNNER_TEMP/verify-release"
+          mkdir -p "$verify_dir"
+          while IFS= read -r asset_name; do
+            asset_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq ".[] | select(.name == \"$asset_name\") | .id")"
+            test -n "$asset_id"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$verify_dir/$asset_name"
+          done <<< "$expected_assets"
+          python3 scripts/release_assets.py verify "$VERSION" "$verify_dir"
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          test "$(jq -r '.draft' <<< "$release_json")" = true
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_SHA"
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$RELEASE_SHA"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          release_id="$RELEASE_ID"
+          test "$(jq -r '.tag_name' <<< "$release_json")" = "$RELEASE_TAG"
+          test "$(jq -r '.draft' <<< "$release_json")" = true
+
+          expected_assets="$(printf '%s\n' \
+            "gantry-$VERSION-darwin-aarch64.tar.gz" \
+            "gantry-$VERSION-linux-aarch64-gnu.tar.gz" \
+            "gantry-$VERSION-linux-x86_64-gnu.tar.gz" \
+            SHA256SUMS | sort)"
+          release_assets="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '.[].name' | sort)"
+          test "$release_assets" = "$expected_assets"
+
+          verify_dir="$RUNNER_TEMP/final-release-verification"
+          mkdir -p "$verify_dir"
+          while IFS= read -r asset_name; do
+            asset_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq ".[] | select(.name == \"$asset_name\") | .id")"
+            test -n "$asset_id"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$verify_dir/$asset_name"
+          done <<< "$expected_assets"
+          python3 scripts/release_assets.py verify "$VERSION" "$verify_dir"
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --field draft=false > /dev/null
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          test "$(jq -r '.tag_name' <<< "$release_json")" = "$RELEASE_TAG"
+          test "$(jq -r '.draft' <<< "$release_json")" = false
+          expected_assets="$(printf '%s\n' \
+            "gantry-$VERSION-darwin-aarch64.tar.gz" \
+            "gantry-$VERSION-linux-aarch64-gnu.tar.gz" \
+            "gantry-$VERSION-linux-x86_64-gnu.tar.gz" \
+            SHA256SUMS | sort)"
+          release_assets="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '.[].name' | sort)"
+          test "$release_assets" = "$expected_assets"

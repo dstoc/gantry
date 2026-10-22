@@ -46,6 +46,69 @@ The binaries are in `target/release/`:
 
 Install `gantry` and `gantry-supervisor` in the same directory.
 
+## Downloaded releases
+
+GitHub Releases provide archives for Linux x86_64, Linux aarch64, and Apple
+Silicon macOS. Each archive contains `gantry`, `gantry-supervisor`,
+`run-remote`, this README, the reference documentation, and the license. The
+Linux archives use the GNU libc target and require glibc 2.35 or later. They
+also require Bubblewrap with descriptor-based bind support and a host that
+permits the namespaces Bubblewrap needs. Install `gantry-supervisor` beside
+`gantry` for the Bubblewrap backend. Bubblewrap is Linux-only. Apple Silicon
+macOS supports the explicitly selected Direct backend.
+
+Archive names include the release version, operating system, and architecture.
+`SHA256SUMS` covers all three archives. For example, download the Linux x86_64
+archive and checksum file for the same release:
+
+```sh
+VERSION=0.4.8
+ARCHIVE="gantry-${VERSION}-linux-x86_64-gnu.tar.gz"
+RELEASE="https://github.com/dstoc/gantry/releases/download/v${VERSION}"
+curl -fLO "${RELEASE}/${ARCHIVE}"
+curl -fLO "${RELEASE}/SHA256SUMS"
+grep "  ${ARCHIVE}$" SHA256SUMS | sha256sum --check --strict -
+tar -xzf "$ARCHIVE"
+sudo install -m 0755 "gantry-${VERSION}-linux-x86_64-gnu"/gantry \
+  "gantry-${VERSION}-linux-x86_64-gnu"/gantry-supervisor \
+  "gantry-${VERSION}-linux-x86_64-gnu"/run-remote /usr/local/bin/
+```
+
+On macOS, verify the selected archive with
+`grep "  ${ARCHIVE}$" SHA256SUMS | shasum -a 256 -c -` instead of
+`sha256sum --check --strict -`.
+
+## Release operation
+
+Release Please reads conventional commits on `main` and opens or updates a
+version and changelog pull request. Merging that pull request creates the
+version tag and a draft GitHub release. Release Please creates the tag at the
+release commit even while the release is a draft.
+
+The manifest starts at version `0.4.7`, which matches `Cargo.toml`. Its
+bootstrap commit keeps older repository history out of the first generated
+changelog. Release tags use the form `vX.Y.Z`.
+
+Release Please uses the workflow token, so its tag does not start a second
+workflow run. The release workflow passes the tag and commit SHA to its build
+and publish jobs in the same run. Its workflow token also does not start the
+normal pull request checks, so it dispatches the existing CI workflow on the
+release branch to produce the required `test` check.
+
+The release workflow builds all three targets from that tag's commit. It checks
+the target architecture, runs binary smoke checks, packages the binaries and
+documentation, and creates `SHA256SUMS`. It uploads the three archives and
+checksum file to the draft, downloads them again, and verifies the uploaded
+bytes before publishing the release. A failed build, upload, or verification
+leaves the release as a draft.
+
+To recover a failed release, open the **Release** workflow in GitHub Actions,
+select `main`, then run it with the exact draft tag, such as `v0.4.8`. The
+workflow checks that the tag points to the same version and still has a draft
+release. It rebuilds the archives, removes stale assets from that draft,
+uploads the expected set, and repeats the checksum checks before publication.
+It rejects tags whose release is already published.
+
 ## Quick start
 
 Create a policy directory and an adjacent filesystem-profile directory:
